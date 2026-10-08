@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AIRFLOW_VERSION: "3.3.2"
+  PYTHON_VERSION: "3.14"
+
+jobs:
+  lint:
+    name: Ruff (check + format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      # Only ruff is needed here, so this job skips installing Airflow.
+      # The version matches the pin in pyproject.toml.
+      - run: uvx ruff@0.16.10 check .
+      - run: uvx ruff@0.16.10 format --check .
+
+  test:
+    name: DAG integrity + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install dependencies (with Airflow constraints)
+        run: |
+          uv venv
+          uv pip install -r pyproject.toml --extra dev \
+            -c "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+      - name: Pytest
+        run: .venv/bin/pytest -v

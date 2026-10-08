@@ -1,0 +1,195 @@
+# =============================================================================
+# Local development stack: Apache Airflow 3.3.2 (Python 3.14) + PostgreSQL 16
+# -----------------------------------------------------------------------------
+# Services
+#   postgres               PostgreSQL 16: Airflow metadata DB ("airflow") and DVF DB ("dvf")
+#   airflow-init           one-shot job: creates folders, fixes ownership, migrates metadata DB
+#   airflow-apiserver      UI + REST API + Task Execution API. In Airflow 3 this
+#                          replaces the "webserver". http://localhost:8080
+#   airflow-scheduler      scheduler running the LocalExecutor, so tasks run as
+#                          subprocesses of this container (the "local worker")
+#   airflow-dag-processor  parses DAG files. It's a required standalone component in Airflow 3
+#
+# Usage
+#   cp .env.example .env        # optional: every value has a default
+#   docker compose up -d
+#   docker compose down         # keeps ./pgdata and ./data
+#   docker compose down -v && rm -rf pgdata   # full reset
+#
+# No triggerer is started because this project has no deferrable operators.
+# Add one (command: triggerer) if you add any.
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2-python3.14}
+  environment: &airflow-common-env
+    # ---- Core ---------------------------------------------------------------
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # schedule=None, so leaving the DAG unpaused is safe and saves a click.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+    # In Airflow 3, task processes talk to the API server, never directly to the DB.
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # Must be identical in every Airflow container (it signs the task JWTs).
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:-local-dev-only-jwt-secret-change-me}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    # LOCAL DEV ONLY: SimpleAuthManager (Airflow 3's default) with no login screen.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "true"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Pick up new DAG files every 30s instead of every 5 min.
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+
+    # ---- Connection: auto-configured at startup -----------------------------
+    # Airflow resolves AIRFLOW_CONN_<CONN_ID> before the metadata DB, so the
+    # connection id "dvf_postgres" exists as soon as the containers start.
+    # (Env-defined connections don't appear in the UI connection list.
+    # `airflow connections get dvf_postgres` does resolve them.)
+    AIRFLOW_CONN_DVF_POSTGRES: >-
+      {"conn_type": "postgres",
+       "host": "postgres",
+       "port": 5432,
+       "login": "${DVF_DB_USER:-dvf}",
+       "password": "${DVF_DB_PASSWORD:-dvf}",
+       "schema": "${DVF_DB_NAME:-dvf}"}
+
+    # ---- Variables read by the DAG through Variable.get() -------------------
+    # Env vars (AIRFLOW_VAR_<KEY>) take precedence over variables set in the
+    # UI. To manage one in the UI instead, remove it from here.
+    AIRFLOW_VAR_DVF_BASE_URL: https://files.data.gouv.fr/geo-dvf/latest/csv
+    AIRFLOW_VAR_DVF_DATA_DIR: /opt/airflow/data/dvf
+    AIRFLOW_VAR_DVF_SQL_DIR: /opt/airflow/sql
+    AIRFLOW_VAR_DVF_POSTGRES_CONN_ID: dvf_postgres
+    AIRFLOW_VAR_DVF_COPY_CHUNK_ROWS: "50000"
+    AIRFLOW_VAR_DVF_MAX_REJECT_RATIO: "0.001"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./config:/opt/airflow/config
+    - ./data:/opt/airflow/data
+    - ./sql:/opt/airflow/sql:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      # Read by docker/postgres/initdb/00_create_dvf_database.sh on first boot.
+      DVF_DB_NAME: ${DVF_DB_NAME:-dvf}
+      DVF_DB_USER: ${DVF_DB_USER:-dvf}
+      DVF_DB_PASSWORD: ${DVF_DB_PASSWORD:-dvf}
+      # A SUBDIRECTORY of the bind mount, so the entrypoint can create it and
+      # chown it to the postgres user. Pointing PGDATA at the mount root fails on
+      # macOS/Windows Docker Desktop with "data directory has wrong ownership".
+      PGDATA: /var/lib/postgresql/data/pgdata
+    # Settings tuned for bulk COPY: fewer forced checkpoints during a ~4M-row load.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - maintenance_work_mem=256MB
+      - -c
+      - max_wal_size=4GB
+      - -c
+      - checkpoint_timeout=15min
+    shm_size: 256mb
+    volumes:
+      # Local directory for data persistence (git-ignored).
+      - ./pgdata:/var/lib/postgresql/data
+      # First-boot scripts: create the dvf role and DB, then apply sql/init.sql.
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - ./sql:/sql:ro
+    ports:
+      # Defaults to 5433 so it doesn't clash with a Postgres already running on the host.
+      - "${DVF_PG_HOST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    user: "0:0"
+    command:
+      - -c
+      - |
+        set -euo pipefail
+        echo "Creating Airflow folders (no-op if they already exist)"
+        mkdir -p /opt/airflow/{logs,dags,plugins,config,data/dvf}
+        echo "Giving them to ${AIRFLOW_UID:-50000}:0"
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config,data}
+        # The image's entrypoint runs `airflow db migrate` when
+        # _AIRFLOW_DB_MIGRATE=true. This creates or upgrades the metadata schema.
+        /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+
+  # ---------------------------------------------------------------------------
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "${AIRFLOW_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+      # Tasks call the Execution API as soon as they start.
+      airflow-apiserver:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully

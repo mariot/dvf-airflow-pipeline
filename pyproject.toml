@@ -1,0 +1,72 @@
+# =============================================================================
+# dvf-airflow-pipeline
+# -----------------------------------------------------------------------------
+# Local tooling for the DVF -> PostgreSQL Airflow pipeline.
+#
+# Airflow itself runs in Docker (see docker-compose.yaml). This venv exists so
+# that your IDE can resolve imports, and so that ruff and pytest run against
+# the same Airflow version and Python version (3.14) as the containers.
+#
+# Airflow must ALWAYS be installed with its official constraints file, or the
+# resolver may pick provider/SQLAlchemy versions Airflow was never tested with.
+# Install it with uv as described in the README:
+#
+#   uv venv --python 3.14
+#   uv pip install -r pyproject.toml --extra dev \
+#       -c https://raw.githubusercontent.com/apache/airflow/constraints-3.3.2/constraints-3.14.txt
+# =============================================================================
+
+[project]
+name = "dvf-airflow-pipeline"
+version = "0.1.0"
+description = "Idempotent, memory-efficient Airflow pipeline loading DVF (Demandes de Valeurs Foncières) from data.gouv.fr into PostgreSQL."
+readme = "README.md"
+# Keep in sync with .python-version and the Docker image tag in docker-compose.yaml.
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    # Same version as the apache/airflow:3.3.2-python3.14 image.
+    "apache-airflow==3.3.2",
+    # The exact version comes from the Airflow constraints file (7.0.2 for 3.3.2).
+    "apache-airflow-providers-postgres",
+    "requests",
+]
+
+[project.optional-dependencies]
+dev = [
+    # Pinned on purpose: when ruff's default rule set grows, CI fails on code
+    # that didn't change. Bump it deliberately, together with the pre-commit rev.
+    "ruff==0.16.10",
+    "pytest>=8",
+    "pre-commit>=4",
+]
+
+# -----------------------------------------------------------------------------
+# Ruff: same setup as datagouv/datagouvfr_data_pipelines.
+# Their CI runs `ruff check .` and `ruff format --check .`, and pre-commit runs
+# `ruff-check --fix --extend-select I` and then `ruff-format`. That means ruff's
+# default rules (pyflakes F + pycodestyle E4/E7/E9) plus isort (I), with
+# ruff's default formatter style. We store the `I` selection here so the
+# editor, CLI, CI and pre-commit all behave the same.
+# -----------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+extend-exclude = ["logs", "data", "pgdata", "plugins"]
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+# Treat dags/ modules as first-party so imports in tests/ are sorted the same
+# way as they are inside dags/.
+known-first-party = ["dvf_common", "dvf_postgres_pipeline", "dvf_change_detector"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Make dags/ importable from tests, the way Airflow adds it to sys.path.
+pythonpath = ["dags"]

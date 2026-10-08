@@ -1,0 +1,20 @@
+# Mirrors datagouv/datagouvfr_data_pipelines: generic hygiene hooks + ruff.
+# Install once with:  pre-commit install
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: detect-private-key
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: debug-statements
+      - id: check-ast
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.10  # keep aligned with the ruff pin in pyproject.toml
+    hooks:
+      - id: ruff-check
+        args: [--fix]  # `I` (isort) is already selected in pyproject.toml
+      - id: ruff-format
