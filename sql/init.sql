@@ -24,6 +24,17 @@
 -- dvf.v_mutations view below, which has one row per mutation.
 -- =============================================================================
 
+-- PostGIS is not a trusted extension: a superuser creates it (initdb does it
+-- on first boot). Fail with a clear message instead of "type geometry does not exist".
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_extension WHERE extname = 'postgis') THEN
+        RAISE EXCEPTION 'PostGIS is missing in this database. As a superuser run: '
+                        'CREATE EXTENSION postgis;';
+    END IF;
+END
+$$;
+
 CREATE SCHEMA IF NOT EXISTS dvf;
 
 COMMENT ON SCHEMA dvf IS
@@ -118,6 +129,24 @@ CREATE INDEX IF NOT EXISTS mutations_commune_date_idx      ON dvf.mutations (cod
 CREATE INDEX IF NOT EXISTS mutations_departement_date_idx  ON dvf.mutations (code_departement, date_mutation);
 CREATE INDEX IF NOT EXISTS mutations_id_parcelle_idx       ON dvf.mutations (id_parcelle);
 
+-- PostGIS point derived from longitude/latitude (WGS84, valid for overseas
+-- departments too). STORED generated column: COPY never writes it, Postgres
+-- computes it, and it can't drift from the coordinates. NULL when either
+-- coordinate is missing. Checked first so that a routine run doesn't take
+-- an ACCESS EXCLUSIVE lock on the whole table.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT FROM information_schema.columns
+        WHERE table_schema = 'dvf' AND table_name = 'mutations' AND column_name = 'geom'
+    ) THEN
+        ALTER TABLE dvf.mutations ADD COLUMN geom geometry(Point, 4326)
+            GENERATED ALWAYS AS (ST_Point(longitude, latitude, 4326)) STORED;
+    END IF;
+END
+$$;
+CREATE INDEX IF NOT EXISTS mutations_geom_idx ON dvf.mutations USING gist (geom);
+
 -- -----------------------------------------------------------------------------
 -- Load audit trail: one row per successful (committed) load of a year.
 -- Written in the SAME transaction as the data, so it never lies.
@@ -137,6 +166,9 @@ CREATE TABLE IF NOT EXISTS dvf.load_log (
     loaded_at           TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
+-- Added later: the source file's Last-Modified (identifies the DVF release).
+ALTER TABLE dvf.load_log ADD COLUMN IF NOT EXISTS source_last_modified TIMESTAMPTZ;
+
 CREATE INDEX IF NOT EXISTS load_log_annee_loaded_at_idx ON dvf.load_log (annee, loaded_at DESC);
 
 -- Latest committed load per year. The dvf_change_detector DAG compares
@@ -151,7 +183,8 @@ SELECT DISTINCT ON (annee)
     rows_loaded,
     rows_rejected,
     dag_run_id,
-    loaded_at
+    loaded_at,
+    source_last_modified
 FROM dvf.load_log
 ORDER BY annee, loaded_at DESC;
 

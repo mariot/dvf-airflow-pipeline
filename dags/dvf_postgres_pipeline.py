@@ -4,7 +4,7 @@ Loads one yearly file of "DVF géolocalisées" (published by Etalab on
 data.gouv.fr) into a LIST-partitioned PostgreSQL table, ``dvf.mutations``.
 
     download_dvf_file ─┐
-                       ├─> load_dvf_into_postgres
+                       ├─> load_dvf_into_postgres ─> refresh_semantic_layer
     sync_schema ───────┘
 
 * ``download_dvf_file``: streams ``{DVF_BASE_URL}/{year}/full.csv.gz`` to the
@@ -16,6 +16,23 @@ data.gouv.fr) into a LIST-partitioned PostgreSQL table, ``dvf.mutations``.
 * ``load_dvf_into_postgres``: reads the gzip file as a stream, cleans each
   record on the fly, and sends CHUNKS of rows to Postgres through an in-memory
   ``StringIO`` buffer and the native ``COPY ... FROM STDIN``.
+* ``refresh_semantic_layer``: rebuilds the query-facing objects of
+  ``sql/semantic.sql`` (``dvf.ventes``, ``dvf.biens``...) from ``dvf.mutations``.
+
+History
+    Loads are APPEND-BY-YEAR: a run only ever replaces its own year's
+    partition. Etalab serves the last 5 years and drops the oldest one at each
+    release, but a year that leaves ``/latest`` is never touched again, so the
+    database keeps every year it has ever loaded. A republished year must not
+    shrink by more than ``DVF_MAX_SHRINK_RATIO`` (default 20%) compared with
+    its previous load, so a truncated upstream file can't erase history.
+
+Format
+    Etalab's files are comma-separated with decimal points (the raw DGFiP
+    files use ``|`` and decimal commas). Columns are mapped by name, so a
+    pipe-separated file fails the schema check, and an optional column whose
+    values stop parsing (e.g. ``"346,5"``) fails the load once its NULLed ratio
+    exceeds ``DVF_MAX_REJECT_RATIO`` instead of being silently NULLed.
 
 Idempotency
     The year's partition is TRUNCATEd and reloaded in ONE transaction, along
@@ -35,6 +52,7 @@ Configuration (Airflow Variables, read at RUN time, never at parse time)
     DVF_POSTGRES_CONN_ID    dvf_postgres
     DVF_COPY_CHUNK_ROWS     50000
     DVF_MAX_REJECT_RATIO    0.001
+    DVF_MAX_SHRINK_RATIO    0.2
 
 Trigger for a given year:
     airflow dags trigger dvf_postgres_pipeline -c '{"year": 2024}'
@@ -53,6 +71,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -73,6 +92,16 @@ DEFAULT_YEAR = datetime.now(tz=UTC).year - 1
 SCHEMA_ADVISORY_LOCK_ID = 7_301_947_001
 
 IO_CHUNK_BYTES = 1024 * 1024  # download chunks and COPY writes
+
+
+def parse_http_date(value: str | None) -> datetime | None:
+    """'Mon, 18 May 2026 12:56:30 GMT' -> aware datetime (None if absent/invalid)."""
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value)
+    except TypeError, ValueError:
+        return None
 
 
 def partition_name(year: int) -> str:
@@ -254,6 +283,39 @@ class LoadStats:
     def reject_ratio(self) -> float:
         return self.rows_rejected / self.rows_read if self.rows_read else 0.0
 
+    def nulled_ratios(self) -> dict[str, float]:
+        """Share of rows whose value was unparseable and set to NULL, per column."""
+        if not self.rows_read:
+            return {}
+        return {name: n / self.rows_read for name, n in self.nulled.items()}
+
+
+def check_format(stats: LoadStats, max_ratio: float) -> None:
+    """Fail when a column's values stopped parsing (format drift, e.g. decimal commas)."""
+    drifted = {
+        name: ratio
+        for name, ratio in stats.nulled_ratios().items()
+        if ratio > max_ratio
+    }
+    if drifted:
+        detail = ", ".join(
+            f"{name}={ratio:.2%}" for name, ratio in sorted(drifted.items())
+        )
+        raise AirflowFailException(
+            f"Format drift: unparseable values above {max_ratio:.4%} in {detail}"
+        )
+
+
+def check_history(
+    rows_loaded: int, previous_rows: int | None, max_shrink: float
+) -> None:
+    """Refuse to replace a year with a much smaller version of itself."""
+    if previous_rows and rows_loaded < previous_rows * (1 - max_shrink):
+        raise AirflowFailException(
+            f"Year would shrink from {previous_rows:,} to {rows_loaded:,} rows "
+            f"(more than DVF_MAX_SHRINK_RATIO={max_shrink:.0%}); keeping the previous load"
+        )
+
 
 def build_plan(header: list[str]) -> list[tuple[int, Column]]:
     """Map each target column to its index in the source header."""
@@ -403,6 +465,7 @@ def download_file(url: str, destination: Path) -> dict[str, Any]:
             "url": url,
             "etag": head.headers.get("ETag"),
             "size": int(head.headers.get("Content-Length", -1)),
+            "last_modified": head.headers.get("Last-Modified"),
         }
 
         if destination.exists() and meta_path.exists():
@@ -423,6 +486,9 @@ def download_file(url: str, destination: Path) -> dict[str, Any]:
             # Re-read metadata from the GET itself, in case the file changed after the HEAD.
             remote["etag"] = response.headers.get("ETag", remote["etag"])
             remote["size"] = int(response.headers.get("Content-Length", remote["size"]))
+            remote["last_modified"] = response.headers.get(
+                "Last-Modified", remote["last_modified"]
+            )
             with part_path.open("wb") as fh:
                 # decode_content=False: store the .gz bytes exactly as served,
                 # even if a proxy adds a Content-Encoding header.
@@ -554,26 +620,39 @@ def dvf_postgres_pipeline() -> None:
                         f"DVF_MAX_REJECT_RATIO={cfg.max_reject_ratio:.4%} "
                         f"({stats.rows_rejected:,} / {stats.rows_read:,} rows)"
                     )
+                check_format(stats, cfg.max_reject_ratio)
                 cur.execute(f"SELECT count(*) FROM {partition}")
                 (db_count,) = cur.fetchone()
                 if db_count != stats.rows_loaded:
                     raise AirflowFailException(
                         f"Row count mismatch: streamed {stats.rows_loaded:,}, table has {db_count:,}"
                     )
+                cur.execute(
+                    "SELECT rows_loaded FROM dvf.v_load_status WHERE annee = %s",
+                    (year,),
+                )
+                previous = cur.fetchone()
+                check_history(
+                    stats.rows_loaded,
+                    previous[0] if previous else None,
+                    cfg.max_shrink_ratio,
+                )
 
                 cur.execute(
                     """
                     INSERT INTO dvf.load_log (
                         annee, source_url, source_etag, source_size_bytes,
+                        source_last_modified,
                         rows_read, rows_loaded, rows_rejected, values_nulled,
                         dag_run_id, duration_seconds
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
                         year,
                         source["url"],
                         source.get("etag"),
                         source.get("size"),
+                        parse_http_date(source.get("last_modified")),
                         stats.rows_read,
                         stats.rows_loaded,
                         stats.rows_rejected,
@@ -604,7 +683,31 @@ def dvf_postgres_pipeline() -> None:
         log.info("Load committed: %s", summary)
         return summary
 
-    load_dvf_into_postgres(source=download_dvf_file(), partition=sync_schema())
+    @task(execution_timeout=timedelta(minutes=30))
+    def refresh_semantic_layer(summary: dict[str, Any]) -> None:
+        """Task 4: rebuild sql/semantic.sql (derived views + reference tables)."""
+        cfg = DvfConfig.from_airflow()
+        ddl = (cfg.sql_dir / "semantic.sql").read_text(encoding="utf-8")
+        hook = PostgresHook(postgres_conn_id=cfg.conn_id)
+        conn = hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                # Same lock as sync_schema: parallel year loads rebuild one at a time.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,)
+                )
+                cur.execute(ddl)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        log.info("Semantic layer rebuilt after loading %s", summary["year"])
+
+    refresh_semantic_layer(
+        load_dvf_into_postgres(source=download_dvf_file(), partition=sync_schema())
+    )
 
 
 dvf_postgres_pipeline()

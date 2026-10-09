@@ -2,7 +2,7 @@
 # Local development stack: Apache Airflow 3.3.2 (Python 3.14) + PostgreSQL 16
 # -----------------------------------------------------------------------------
 # Services
-#   postgres               PostgreSQL 16: Airflow metadata DB ("airflow") and DVF DB ("dvf")
+#   postgres               PostgreSQL 16 + PostGIS: Airflow metadata DB ("airflow") and DVF DB ("dvf")
 #   airflow-init           one-shot job: creates folders, fixes ownership, migrates metadata DB
 #   airflow-apiserver      UI + REST API + Task Execution API. In Airflow 3 this
 #                          replaces the "webserver". http://localhost:8080
@@ -64,6 +64,7 @@ x-airflow-common: &airflow-common
     AIRFLOW_VAR_DVF_POSTGRES_CONN_ID: dvf_postgres
     AIRFLOW_VAR_DVF_COPY_CHUNK_ROWS: "50000"
     AIRFLOW_VAR_DVF_MAX_REJECT_RATIO: "0.001"
+    AIRFLOW_VAR_DVF_MAX_SHRINK_RATIO: "0.2"
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
@@ -79,7 +80,10 @@ x-airflow-common: &airflow-common
 services:
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16
+    # postgres:16 + PostGIS 3 (docker/postgres/Dockerfile). PostGIS powers the
+    # spatial columns of the semantic layer (sql/semantic.sql).
+    build: ./docker/postgres
+    image: dvf-postgres:16-postgis
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow

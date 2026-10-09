@@ -31,6 +31,14 @@ psql -v ON_ERROR_STOP=1 \
 	GRANT CONNECT, TEMPORARY ON DATABASE :"dvf_db" TO :"dvf_user";
 EOSQL
 
+# PostGIS is not a trusted extension, so the superuser creates it; the dvf role
+# then owns every object built on top of it (sql/semantic.sql).
+echo "[initdb] enabling PostGIS in '${DVF_DB_NAME}'"
+psql -v ON_ERROR_STOP=1 \
+     --username "${POSTGRES_USER}" \
+     --dbname "${DVF_DB_NAME}" \
+     --command "CREATE EXTENSION IF NOT EXISTS postgis"
+
 echo "[initdb] applying /sql/init.sql to '${DVF_DB_NAME}' as '${DVF_DB_USER}'"
 
 # During initdb the server only listens on the Unix socket, where the image

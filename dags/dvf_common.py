@@ -37,6 +37,7 @@ class DvfConfig:
     conn_id: str
     chunk_rows: int
     max_reject_ratio: float
+    max_shrink_ratio: float
 
     @classmethod
     def from_airflow(cls) -> DvfConfig:
@@ -53,6 +54,7 @@ class DvfConfig:
             max_reject_ratio=float(
                 Variable.get("DVF_MAX_REJECT_RATIO", default="0.001")
             ),
+            max_shrink_ratio=float(Variable.get("DVF_MAX_SHRINK_RATIO", default="0.2")),
         )
 
     def source_url(self, year: int) -> str:

@@ -116,6 +116,61 @@ def test_schema_drift_fails_fast():
 TARGET_INDEX = {name: i for i, name in enumerate(dvf.TARGET_COLUMNS)}
 
 
+# ---------------------------------------------------------------- format
+def test_raw_dgfip_pipe_file_fails_schema_check():
+    """The raw DGFiP export is pipe-separated with French headers: fail fast."""
+    lines = [
+        "Identifiant de document|No disposition|Date mutation|Nature mutation|Valeur fonciere\n",
+        "|000001|02/01/2024|Vente|346,50\n",
+    ]
+    with pytest.raises(dvf.AirflowFailException, match="schema drift"):
+        list(dvf.iter_clean_rows(lines, 2024, dvf.LoadStats()))
+
+
+def test_decimal_comma_prices_fail_the_load_instead_of_being_nulled():
+    body = SAMPLE.replace(",Vente,346.5,", ',Vente,"346,5",').replace(
+        ",Vente,329500,", ',Vente,"329500,00",'
+    )
+    stats = dvf.LoadStats()
+    rows = list(dvf.iter_clean_rows(_csv(HEADER, body), 2024, stats))
+    assert len(rows) == 2  # rows survive, the price is NULLed...
+    assert stats.nulled["valeur_fonciere"] == 2
+    with pytest.raises(dvf.AirflowFailException, match="valeur_fonciere=100.00%"):
+        dvf.check_format(stats, max_ratio=0.001)  # ...but the load is refused
+
+
+def test_clean_file_passes_format_check():
+    stats = dvf.LoadStats()
+    list(dvf.iter_clean_rows(_csv(HEADER, SAMPLE), 2024, stats))
+    dvf.check_format(stats, max_ratio=0.001)
+
+
+def test_prices_keep_their_decimals():
+    rows = list(dvf.iter_clean_rows(_csv(HEADER, SAMPLE), 2024, dvf.LoadStats()))
+    assert rows[0][TARGET_INDEX["valeur_fonciere"]] == Decimal("346.5")
+
+
+# --------------------------------------------------------------- history
+@pytest.mark.parametrize(
+    ("loaded", "previous"),
+    [(100, None), (100, 100), (150, 100), (81, 100)],
+)
+def test_history_gate_allows_first_load_growth_and_small_revisions(loaded, previous):
+    dvf.check_history(loaded, previous, max_shrink=0.2)
+
+
+def test_history_gate_refuses_a_shrunken_year():
+    with pytest.raises(dvf.AirflowFailException, match="shrink"):
+        dvf.check_history(79, 100, max_shrink=0.2)
+
+
+def test_parse_http_date():
+    parsed = dvf.parse_http_date("Mon, 18 May 2026 12:56:30 GMT")
+    assert parsed.isoformat() == "2026-05-18T12:56:30+00:00"
+    assert dvf.parse_http_date(None) is None
+    assert dvf.parse_http_date("garbage") is None
+
+
 # ------------------------------------------------- driver-agnostic COPY
 class Psycopg2Cursor:
     def __init__(self):
@@ -204,6 +259,7 @@ def test_dags_folder_parses_like_the_dag_processor():
             "download_dvf_file": [],
             "sync_schema": [],
             "load_dvf_into_postgres": ["download_dvf_file", "sync_schema"],
+            "refresh_semantic_layer": ["load_dvf_into_postgres"],
         },
         "dvf_change_detector": {
             "detect_changes": [],

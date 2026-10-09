@@ -1,7 +1,7 @@
 # dvf-airflow-pipeline
 
 Loads **DVF géolocalisées** (Demandes de Valeurs Foncières, published by Etalab on
-data.gouv.fr) into **PostgreSQL 16** with **Apache Airflow 3.3.2** on
+data.gouv.fr) into **PostgreSQL 16 + PostGIS** with **Apache Airflow 3.3.2** on
 **Python 3.14**. The pipeline is idempotent, keeps memory flat, and detects
 when the source files change.
 
@@ -15,8 +15,10 @@ dags/
   dvf_postgres_pipeline.py   loader DAG: download -> schema sync -> streaming COPY
   dvf_change_detector.py     daily DAG: detects new/changed yearly files and triggers the loader
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
-sql/init.sql                 idempotent DDL: partitioned table, audit log, analytics views
-docker/postgres/initdb/      first-boot script: creates the dvf role + database
+sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log
+sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.lieux, dvf.zones
+docker/postgres/Dockerfile   postgres:16 + PostGIS 3 (arm64 and amd64)
+docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
 docker-compose.yaml          Postgres 16 + Airflow (api-server, scheduler/LocalExecutor, dag-processor)
 tests/                       unit tests + DAG integrity test (run in CI)
 .github/workflows/ci.yml     ruff check, ruff format --check, pytest
@@ -35,7 +37,7 @@ uv pip install -r pyproject.toml --extra dev \
 
 ruff check .            # lint (ruff defaults + isort)
 ruff format .           # format
-pytest                  # 28 tests, ~3s
+pytest                  # 38 tests, ~20s
 pre-commit install      # optional: same checks on every commit
 ```
 
@@ -43,7 +45,7 @@ pre-commit install      # optional: same checks on every commit
 
 ```bash
 cp .env.example .env    # optional, all values have defaults
-docker compose up -d
+docker compose up -d    # builds the Postgres + PostGIS image on first run
 ```
 
 | What | Where |
@@ -54,7 +56,19 @@ docker compose up -d
 | Postgres data directory | `./pgdata/` |
 
 On first start, Postgres creates two databases: `airflow` (metadata) and `dvf`
-(data, owned by a dedicated `dvf` role). It then applies `sql/init.sql` to `dvf`.
+(data, owned by a dedicated `dvf` role). It enables PostGIS in `dvf` (PostGIS
+is not a trusted extension, so the superuser does it), then applies
+`sql/init.sql`.
+
+**Upgrading an existing `./pgdata`** created before PostGIS was added: the
+image keeps the same Debian base and Postgres major, so the data directory is
+reused as is. Enable the extension once, then reload any year (or run the two
+SQL files) to add the geometry column and build the semantic layer:
+
+```bash
+docker compose up -d --build
+docker compose exec postgres psql -U airflow -d dvf -c 'CREATE EXTENSION IF NOT EXISTS postgis'
+```
 
 ## 3. Load data
 
@@ -72,7 +86,8 @@ docker compose exec airflow-scheduler airflow dags trigger dvf_change_detector
 docker compose exec airflow-scheduler airflow dags trigger dvf_postgres_pipeline -c '{"year": 2024}'
 ```
 
-Re-running any year is safe. The year is **replaced** in one transaction, never appended.
+Re-running any year is safe. That year's partition is **replaced** in one
+transaction; every other year is left untouched (see *History* below).
 
 ## 4. How it works
 
@@ -80,14 +95,14 @@ Re-running any year is safe. The year is **replaced** in one transaction, never 
 
 ```
 download_dvf_file ─┐
-                   ├─> load_dvf_into_postgres
+                   ├─> load_dvf_into_postgres ─> refresh_semantic_layer
 sync_schema ───────┘
 ```
 
 1. **download_dvf_file**: streams `{DVF_BASE_URL}/{year}/full.csv.gz` to disk in
    1 MiB chunks into a `.part` file, then renames it atomically. It records the
-   ETag and size in a `.meta.json` sidecar and skips the download when they
-   still match.
+   ETag, size and Last-Modified in a `.meta.json` sidecar and skips the
+   download when they still match.
 2. **sync_schema**: applies `sql/init.sql` (idempotent) and creates the
    `dvf.mutations_<year>` partition. A Postgres advisory lock serializes DDL
    when several years load in parallel.
@@ -103,6 +118,8 @@ sync_schema ───────┘
    every `DVF_COPY_CHUNK_ROWS` rows. The same transaction does
    `TRUNCATE partition` → COPY chunks → quality gates → `load_log` insert →
    `ANALYZE` → commit.
+4. **refresh_semantic_layer**: applies `sql/semantic.sql` under the same
+   advisory lock (about 15 s for Gironde). See section 6.
 
 **Idempotency.** Any failure rolls back the whole year, which keeps its
 previous data. The `(annee, num_ligne_source)` primary key also makes a
@@ -113,6 +130,29 @@ duplicate load impossible.
 - reject ratio above `DVF_MAX_REJECT_RATIO`
 - the row count in the table differs from the rows streamed
 - the source schema has drifted (a missing column fails fast; columns are mapped by name)
+- **format drift**: an optional column whose unparseable values (set to NULL)
+  exceed `DVF_MAX_REJECT_RATIO`, e.g. prices with decimal commas
+- **history**: the year would shrink by more than `DVF_MAX_SHRINK_RATIO`
+  compared with its previous committed load
+
+**Format.** Etalab's files are comma-separated with decimal points, unlike the
+raw DGFiP export (`|` separators, decimal commas, French headers). Feeding a
+DGFiP file fails the schema check; a decimal comma inside an Etalab file fails
+the format gate instead of being silently NULLed. Prices are `NUMERIC(15,2)`
+parsed with `Decimal`, so cents are exact. Cross-check: the same method as
+Etalab's `statistiques-dvf` run on the loaded data reproduces their published
+Bordeaux monthly medians (apartments and houses, counts and EUR/m²) exactly for
+23 of 24 months of 2024-2025.
+
+**History (append by year).** DVF covers ~5 years and each release (April
+and October) drops the oldest one. A truncate-and-reload of the whole table
+would lose that year. Here a load only ever replaces **its own year's
+partition**: years that leave `/latest` are never touched again and stay in
+Postgres, and a republished year that comes back much smaller is refused
+(shrink gate). `load_log.source_last_modified` records which release each year
+came from. Neither data.gouv.fr nor Etalab serves years before 2021 any more,
+so history can only accumulate from the first load onward: don't delete
+`./pgdata` lightly.
 
 **Memory.** Only one chunk (about 15 MB) is in RAM at a time. When the 2024
 load was measured (3.5M rows), the worker container used about 140 MiB above
@@ -152,7 +192,7 @@ Years that drop off `/latest` are only logged. Their data stays in Postgres.
 To check freshness by hand:
 
 ```sql
-SELECT annee, source_etag, rows_loaded, loaded_at FROM dvf.v_load_status;
+SELECT annee, source_last_modified, rows_loaded, loaded_at FROM dvf.v_load_status;
 ```
 
 ## 5. Configuration
@@ -167,7 +207,8 @@ and read at **run time**, not at parse time.
 | `DVF_SQL_DIR` | `/opt/airflow/sql` | Mounted from `./sql` (read-only) |
 | `DVF_POSTGRES_CONN_ID` | `dvf_postgres` | |
 | `DVF_COPY_CHUNK_ROWS` | `50000` | Rows per COPY / RAM bound |
-| `DVF_MAX_REJECT_RATIO` | `0.001` | Fails the load above 0.1% rejected rows |
+| `DVF_MAX_REJECT_RATIO` | `0.001` | Fails the load above 0.1% rejected rows, or 0.1% unparseable values in a column |
+| `DVF_MAX_SHRINK_RATIO` | `0.2` | Refuses to replace a year with a version more than 20% smaller |
 
 Variables defined as env vars take precedence over the UI. To manage one in
 the UI, delete it from the compose file.
@@ -176,23 +217,50 @@ the UI, delete it from the compose file.
 startup. It doesn't appear in the UI list, but
 `airflow connections get dvf_postgres` resolves it.
 
-## 6. Querying DVF correctly
+## 6. Querying DVF correctly (semantic layer)
 
-One mutation (`id_mutation`) spans **several rows** (one per parcel or
-lot), and each row **repeats the total `valeur_fonciere`**. Never
-`SUM(valeur_fonciere)` over `dvf.mutations`. Use `dvf.v_mutations`, which
-has one row per mutation:
+Query `sql/semantic.sql`'s objects, not `dvf.mutations`. They are scoped to
+Gironde (change the `SCOPE` filter to widen them) and rebuilt after each load.
+
+| Object | Grain | Use for |
+|---|---|---|
+| `dvf.ventes` | 1 row per mutation | counts of sales, totals, prices, `prix_m2` |
+| `dvf.biens` | 1 row per deduplicated property | "N appartements vendus", surfaces, pièces |
+| `dvf.lieux` | landmark | distances (Place de la Bourse, Gare Saint-Jean...) |
+| `dvf.zones` | (zone, commune) | Bordeaux Métropole, Bassin d'Arcachon |
+| `dvf.communes` | commune | name lookup |
+
+Traps the layer handles (all found in the data):
+
+- **Duplication.** One mutation spans several rows and each row repeats the
+  total `valeur_fonciere`: in Gironde 2024 a naive `SUM` over rows gives
+  73.5 bn EUR instead of 8.84 bn. DVF also repeats a local once per nature de
+  culture of its parcel (14 371 raw `Maison` rows for 12 388 houses).
+  `dvf.biens` keeps the max count across cultures, so identical flats sold
+  together still count separately.
+- **Single-property sales.** `vente_reference` = exactly one house or
+  apartment (dépendances allowed), nature Vente or VEFA, price > 0. `prix_m2`
+  is only set on those rows.
+- **VEFA.** ~95% of VEFA sales have no `type_local` and no surface (lots of a
+  building not yet in the cadastre): `type_bien = 'Lot non décrit'`.
+- **Missing values** (Gironde 2024): 272 sales without coordinates (they drop
+  out of spatial queries), 556 rows without price; surfaces and room counts
+  are missing on <0.01% of house/apartment rows.
+- **Spatial.** `dvf.mutations.geom` is a WGS84 point (all of France, GiST
+  indexed, generated from longitude/latitude). The semantic layer's `geom`
+  columns are Lambert-93 (EPSG:2154): units are metres, so
+  `ST_DWithin(v.geom, l.geom, 500)` means 500 m and uses the GiST index.
 
 ```sql
--- Median price of single-apartment sales, by department, 2024
-SELECT code_departement,
-       count(*) AS ventes,
-       percentile_cont(0.5) WITHIN GROUP (ORDER BY valeur_fonciere) AS prix_median
-FROM dvf.v_mutations
-WHERE annee = 2024 AND nature_mutation = 'Vente'
-  AND nb_appartements = 1 AND nb_maisons = 0
-GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+-- Median EUR/m² of apartments within 1 km of Gare Saint-Jean, 2024
+SELECT round(percentile_cont(0.5) WITHIN GROUP (ORDER BY v.prix_m2)) AS prix_m2_median
+FROM dvf.ventes v JOIN dvf.lieux l ON l.nom = 'Gare Saint-Jean'
+WHERE v.annee = 2024 AND v.type_bien = 'Appartement' AND v.prix_m2 IS NOT NULL
+  AND ST_DWithin(v.geom, l.geom, 1000);
 ```
+
+The full set of conventions, with verified gold queries, lives in the text-to-SQL
+evaluation set (`dvf_eval_questions.yaml`).
 
 ## 7. Operations
 
