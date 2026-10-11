@@ -197,3 +197,34 @@ def test_files_served_gzip_compressed_are_read_as_text(tmp_path):
     path.write_bytes(gzip.compress(LOVAC_COMMUNES.encode("cp1252")))
     text = lg.decode(lg.read_downloaded(path))
     assert text.startswith('"CODGEO_26"')
+
+
+def test_dpe_records_from_the_api():
+    record = {  # real record (Gironde, 2026-10-05), API values already typed
+        "numero_dpe": "2633E2544215X",
+        "date_etablissement_dpe": "2026-10-05",
+        "etiquette_dpe": "D",
+        "type_batiment": "appartement",
+        "periode_construction": "1948-1974",
+        "surface_habitable_logement": 79,
+        "cout_total_5_usages": 1653,
+        "identifiant_ban": "33243_83jcud",
+        "coordonnee_cartographique_x_ban": 445376.38,
+        "coordonnee_cartographique_y_ban": 6423711.5,
+        "numero_etage_appartement": None,
+    }
+    stats = LoadStats()
+    (row,) = lg.iter_dpe([record], stats)
+    values = dict(zip(lg.DPE_SPEC, row))
+    assert values["etiquette_dpe"] == "D" and values["date_dpe"] == "2026-10-05"
+    assert values["surface_m2"] == Decimal(79) and values["cout_annuel_eur"] == Decimal(
+        1653
+    )
+    assert values["x"] == Decimal("445376.38") and values["etage"] is None
+    assert stats.rows_rejected == 0
+
+
+def test_dpe_without_a_label_is_rejected():
+    stats = LoadStats()
+    assert list(lg.iter_dpe([{"numero_dpe": "X1", "etiquette_dpe": None}], stats)) == []
+    assert stats.rows_rejected == 1

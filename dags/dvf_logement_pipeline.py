@@ -358,6 +358,84 @@ def iter_cdc(text: str, stats: LoadStats) -> Iterator[list[Any]]:
 
 
 # =============================================================================
+# DPE (ADEME): energy performance certificates of existing dwellings
+# =============================================================================
+DPE_API = "https://data.ademe.fr/data-fair/api/v1/datasets/dpe03existant/lines"
+DPE_FIELDS = {  # target -> ADEME field
+    "numero_dpe": "numero_dpe",
+    "date_dpe": "date_etablissement_dpe",
+    "numero_dpe_remplace": "numero_dpe_remplace",
+    "etiquette_dpe": "etiquette_dpe",
+    "etiquette_ges": "etiquette_ges",
+    "type_batiment": "type_batiment",
+    "methode": "methode_application_dpe",
+    "periode_construction": "periode_construction",
+    "annee_construction": "annee_construction",
+    "typologie": "typologie_logement",
+    "surface_m2": "surface_habitable_logement",
+    "etage": "numero_etage_appartement",
+    "nb_niveaux_immeuble": "nombre_niveau_immeuble",
+    "energie_chauffage": "type_energie_principale_chauffage",
+    "cout_annuel_eur": "cout_total_5_usages",
+    "conso_ep_m2": "conso_5_usages_par_m2_ep",
+    "code_commune": "code_insee_ban",
+    "adresse": "adresse_ban",
+    "identifiant_ban": "identifiant_ban",
+    "score_ban": "score_ban",
+    "x": "coordonnee_cartographique_x_ban",
+    "y": "coordonnee_cartographique_y_ban",
+}
+DPE_CONVERTERS = {
+    "annee_construction": to_year,
+    "surface_m2": to_decimal,
+    "etage": to_int,
+    "nb_niveaux_immeuble": to_int,
+    "cout_annuel_eur": to_decimal,
+    "conso_ep_m2": to_decimal,
+    "score_ban": to_decimal,
+    "x": to_decimal,
+    "y": to_decimal,
+}
+DPE_SPEC: Spec = {
+    target: ((source,), DPE_CONVERTERS.get(target, to_text))
+    for target, source in DPE_FIELDS.items()
+}
+
+
+def dpe_pages(session: requests.Session, departement: str, page_size: int = 10_000):
+    """Every DPE of one department, following the API's cursor ('next')."""
+    url: str | None = DPE_API
+    params: dict[str, Any] | None = {
+        "size": page_size,
+        "qs": f"code_departement_ban:{departement}",
+        "select": ",".join(DPE_FIELDS.values()),
+        "sort": "numero_dpe",
+    }
+    while url:
+        response = session.get(url, params=params, timeout=HTTP_TIMEOUT)
+        response.raise_for_status()
+        page = response.json()
+        results = page.get("results", [])
+        if not results:
+            return
+        yield page.get("total"), results
+        url, params = page.get("next"), None
+
+
+def iter_dpe(records: list[dict[str, Any]], stats: LoadStats) -> Iterator[list[Any]]:
+    """API values are already typed: render them as text for the shared converters."""
+    as_text = ({k: "" if v is None else str(v) for k, v in r.items()} for r in records)
+    yield from iter_typed(
+        as_text,
+        list(DPE_FIELDS.values()),
+        DPE_SPEC,
+        {"numero_dpe", "etiquette_dpe"},
+        stats,
+        "DPE",
+    )
+
+
+# =============================================================================
 # DAG
 # =============================================================================
 @dag(
@@ -465,6 +543,34 @@ def dvf_logement_pipeline() -> None:
         replace_rows(cfg, "dvf.ref_series_longues", SERIES_COLUMNS, rows)
         return {"rows": stats.rows_loaded}
 
+    @task(execution_timeout=timedelta(hours=1))
+    def load_dpe() -> dict[str, Any]:
+        """All DPE of the scope departments, replaced in one transaction."""
+        cfg = DvfConfig.from_airflow()
+        stats = LoadStats()
+        rows: list[list[Any]] = []
+        with requests.Session() as session:
+            for departement in cfg.scope_departements:
+                expected = None
+                for total, records in dpe_pages(session, departement):
+                    expected = total
+                    rows.extend(iter_dpe(records, stats))
+                log.info(
+                    "DPE %s: %s read (API total %s)",
+                    departement,
+                    stats.rows_read,
+                    expected,
+                )
+        check_gates(stats, 1_000, cfg.max_reject_ratio, "DPE")
+        replace_rows(cfg, "dvf.ref_dpe", list(DPE_SPEC), rows)
+        hook = PostgresHook(postgres_conn_id=cfg.conn_id)
+        hook.run("""
+            UPDATE dvf.ref_dpe d SET remplace = true
+            WHERE EXISTS (SELECT 1 FROM dvf.ref_dpe n WHERE n.numero_dpe_remplace = d.numero_dpe);
+            ANALYZE dvf.ref_dpe;
+        """)
+        return {"rows": stats.rows_loaded}
+
     @task(execution_timeout=timedelta(minutes=10))
     def load_cdc() -> dict[str, Any]:
         cfg = DvfConfig.from_airflow()
@@ -479,7 +585,7 @@ def dvf_logement_pipeline() -> None:
 
     schema = sync_schema()
     editions = plan_rpls()
-    schema >> [editions, load_lovac(), load_series_longues(), load_cdc()]
+    schema >> [editions, load_lovac(), load_series_longues(), load_cdc(), load_dpe()]
     load_rpls.expand(millesime=editions)
 
 

@@ -569,9 +569,13 @@ def dvf_postgres_pipeline() -> None:
     def refresh_semantic_layer(
         summary: dict[str, Any], communes: dict[str, Any]
     ) -> None:
-        """Task 4: rebuild sql/semantic.sql (derived views + reference tables)."""
+        """Task 4: rebuild the semantic layer (sql/semantic.sql + semantic_cadre_de_vie.sql)."""
         cfg = DvfConfig.from_airflow()
-        ddl = (cfg.sql_dir / "semantic.sql").read_text(encoding="utf-8")
+        # semantic.sql (DVF objects), then the housing / living-environment views
+        ddl = "\n".join(
+            (cfg.sql_dir / name).read_text(encoding="utf-8")
+            for name in ("semantic.sql", "semantic_cadre_de_vie.sql")
+        )
         hook = PostgresHook(postgres_conn_id=cfg.conn_id)
         conn = hook.get_conn()
         try:

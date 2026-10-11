@@ -286,6 +286,7 @@ def test_dags_folder_parses_like_the_dag_processor():
             "load_lovac": ["sync_schema"],
             "load_series_longues": ["sync_schema"],
             "load_cdc": ["sync_schema"],
+            "load_dpe": ["sync_schema"],
         },
         "dvf_loyers_pipeline": {
             "sync_schema": [],

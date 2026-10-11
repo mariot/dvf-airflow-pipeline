@@ -284,6 +284,46 @@ COMMENT ON TABLE dvf.ref_series_longues IS
     'Long series 1800-2020 (IGEDD): amounts in EUR even before 1999 (1 EUR = 6.55957 FRF); '
     'the latest years may be provisional';
 
+-- DPE (ADEME): energy performance certificates of existing dwellings, since
+-- July 2021, scope DVF_SCOPE_DEPARTEMENTS. ADEME publishes only current
+-- certificates (the ones they replace are absent), so `remplace` stays false.
+-- TRAP: ~21% of apartment certificates are "généré à partir des données DPE
+-- immeuble" (methode): one building rating copied to every apartment; count
+-- individual ratings with methode = 'dpe appartement individuel'.
+-- Rental bans: G since 2025, F from 2028, E from 2034. cout_annuel_eur is the
+-- conventional estimate of the DPE, not a bill.
+CREATE TABLE IF NOT EXISTS dvf.ref_dpe (
+    numero_dpe            TEXT PRIMARY KEY,
+    date_dpe              DATE,
+    numero_dpe_remplace   TEXT,
+    remplace              BOOLEAN NOT NULL DEFAULT false,
+    etiquette_dpe         CHAR(1) NOT NULL,
+    etiquette_ges         CHAR(1),
+    type_batiment         TEXT,           -- maison | appartement | immeuble
+    periode_construction  TEXT,
+    annee_construction    SMALLINT,
+    typologie             TEXT,           -- T1, T2...
+    surface_m2            NUMERIC(8,1),
+    etage                 SMALLINT,
+    nb_niveaux_immeuble   SMALLINT,
+    energie_chauffage     TEXT,
+    cout_annuel_eur       NUMERIC(10,1),  -- estimated annual energy cost
+    conso_ep_m2           NUMERIC(8,1),   -- primary energy, kWh/m²/year
+    code_commune          VARCHAR(5),
+    adresse               TEXT,
+    identifiant_ban       TEXT,
+    score_ban             NUMERIC(5,3),   -- geocoding confidence (0-1)
+    x                     NUMERIC(12,2),
+    y                     NUMERIC(12,2),
+    geom                  geometry(Point, 2154)
+        GENERATED ALWAYS AS (ST_SetSRID(ST_MakePoint(x::float8, y::float8), 2154)) STORED
+);
+ALTER TABLE dvf.ref_dpe ADD COLUMN IF NOT EXISTS methode TEXT;  -- individual or generated from the building
+CREATE INDEX IF NOT EXISTS ref_dpe_geom_idx ON dvf.ref_dpe USING gist (geom);
+CREATE INDEX IF NOT EXISTS ref_dpe_commune_idx ON dvf.ref_dpe (code_commune);
+COMMENT ON TABLE dvf.ref_dpe IS
+    'ADEME DPE of existing dwellings (Licence Ouverte), one row per certificate';
+
 -- CDC: median surfaces and cost prices of financed social housing operations.
 CREATE TABLE IF NOT EXISTS dvf.ref_cdc_logement_social (
     code_region                   VARCHAR(3)    NOT NULL,
@@ -399,10 +439,19 @@ CREATE TABLE IF NOT EXISTS dvf.acces_poles (
     arrivee_debut     TIME NOT NULL DEFAULT '07:30',   -- arrival window on the reference day
     arrivee_fin       TIME NOT NULL DEFAULT '09:00'
 );
+-- Where people commute to: the centre and the main employment / study hubs.
 INSERT INTO dvf.acces_poles (pole, geom)
-VALUES ('Centre de Bordeaux', ST_Transform(ST_SetSRID(ST_MakePoint(-0.57451, 44.84246), 4326), 2154))
-ON CONFLICT DO NOTHING;
-COMMENT ON TABLE dvf.acces_poles IS 'Destinations of the door-to-pole times (Centre de Bordeaux = Grand Théâtre)';
+SELECT pole, ST_Transform(ST_SetSRID(ST_MakePoint(lon, lat), 4326), 2154)
+FROM (VALUES
+    ('Centre de Bordeaux',          -0.57451, 44.84246),  -- Grand Théâtre
+    ('Gare Saint-Jean',             -0.55625, 44.82589),  -- station, Euratlantique business district
+    ('Aéroport de Mérignac',        -0.70130, 44.83050),  -- terminal (tram A / bus stops), aeronautics business area
+    ('CHU Pellegrin',               -0.60740, 44.82640),  -- main university hospital
+    ('Campus Talence-Pessac',       -0.60000, 44.80650)   -- Université de Bordeaux main campus
+) AS p (pole, lon, lat)
+ON CONFLICT (pole) DO UPDATE SET geom = EXCLUDED.geom;
+COMMENT ON TABLE dvf.acces_poles IS
+    'Commute destinations: Centre de Bordeaux (Grand Théâtre) and main employment / study hubs';
 
 CREATE TABLE IF NOT EXISTS dvf.transport_temps_pole (
     arret              TEXT NOT NULL,

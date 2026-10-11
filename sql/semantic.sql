@@ -121,10 +121,12 @@ SELECT
     r.densite,
     r.grille_densite,
     r.latitude,
-    r.longitude
+    r.longitude,
+    g.geom
 FROM ref AS r
 FULL JOIN dvf_noms AS d ON d.code_commune = r.code_insee
-LEFT JOIN postaux AS pc ON pc.code_commune = coalesce(r.code_insee, d.code_commune);
+LEFT JOIN postaux AS pc ON pc.code_commune = coalesce(r.code_insee, d.code_commune)
+LEFT JOIN dvf.ref_communes_contours AS g ON g.code_commune = coalesce(r.code_insee, d.code_commune);
 
 COMMENT ON MATERIALIZED VIEW dvf.communes IS
     'Communes of the scope (Gironde): one row and one canonical name per INSEE code. '
@@ -138,8 +140,10 @@ COMMENT ON COLUMN dvf.communes.codes_postaux IS 'Postal codes seen in DVF for th
 COMMENT ON COLUMN dvf.communes.epci_nom IS 'Intercommunality (e.g. Bordeaux Métropole)';
 COMMENT ON COLUMN dvf.communes.population IS 'Population (official list edition, see dvf.ref_communes)';
 COMMENT ON COLUMN dvf.communes.latitude IS 'Centre of the commune, WGS84';
+COMMENT ON COLUMN dvf.communes.geom IS 'Outline of the commune, Lambert-93 (geo.api.gouv.fr)';
 
 CREATE UNIQUE INDEX communes_code_idx ON dvf.communes (code_commune);
+CREATE INDEX communes_geom_idx ON dvf.communes USING gist (geom);
 
 -- dvf.biens: one row per deduplicated property (local) of a mutation.
 CREATE MATERIALIZED VIEW dvf.biens AS

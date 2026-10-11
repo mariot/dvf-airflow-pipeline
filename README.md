@@ -22,6 +22,7 @@ dags/
   dvf_io.py                  shared converters, COPY and download helpers (no DAG; .airflowignore)
 sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log, reference tables
 sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.communes, dvf.lieux, dvf.zones
+sql/semantic_cadre_de_vie.sql  semantic views on the housing / living-environment data (rents, schools, commutes...)
 docker/postgres/Dockerfile   postgres:16 + PostGIS 3 + pgRouting (arm64 and amd64)
 docker/airflow/Dockerfile    apache/airflow:3.3.2-python3.14 + xlrd (legacy .xls) + osmium (OpenStreetMap)
 docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
@@ -313,10 +314,28 @@ the walking graph is what limits the scale on a laptop.
   every stop (cost = its typical transit time) and to the pole (walking only),
   capped at 90 min, gives door-to-centre time for every vertex.
 
+Destinations (`dvf.acces_poles`): Centre de Bordeaux (Grand Théâtre), Gare
+Saint-Jean (Euratlantique), Aéroport de Mérignac (terminal, aeronautics
+area), CHU Pellegrin, Campus Talence-Pessac. Commune medians of the typical
+door-to-destination time include walking and waiting, so they are higher
+than vehicle times (e.g. Mérignac -> airport 37 min, Bègles -> Gare
+Saint-Jean 23 min).
+
 `dvf.v_acces_adresses` gives, per address, the walking minutes to the nearest
 maternelle, élémentaire, collège and lycée, and the typical door-to-centre
 minutes. In Gironde, 60% of addresses have an elementary school within 15 min
 on foot, and 8.6% are within 30 min of the centre of Bordeaux.
+
+### Semantic views on the new data (`sql/semantic_cadre_de_vie.sql`)
+
+Applied after `sql/semantic.sql` by `refresh_semantic_layer`; all scoped to
+Gironde and linked by `code_commune` to `dvf.communes` (which now also holds
+each commune's outline): `dvf.loyers`, `dvf.logements_sociaux`,
+`dvf.logements_vacants`, `dvf.series_longues`, `dvf.cout_logement_social`,
+`dvf.ecoles`, `dvf.ecoles_ips`, `dvf.colleges_ivac`, `dvf.arrets_transport`,
+`dvf.dpe`, `dvf.acces_adresses` and `dvf.temps_trajet` (commute minutes per
+address and destination). Plain views: they never touch `dvf.ventes` /
+`dvf.biens`, so they can't change a result of the eval set.
 
 ## 5. Configuration
 
