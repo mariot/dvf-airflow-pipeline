@@ -4,8 +4,9 @@ Loads one yearly file of "DVF géolocalisées" (published by Etalab on
 data.gouv.fr) into a LIST-partitioned PostgreSQL table, ``dvf.mutations``.
 
     download_dvf_file ─┐
-                       ├─> load_dvf_into_postgres ─> refresh_semantic_layer
-    sync_schema ───────┘
+                       ├─> load_dvf_into_postgres ───┐
+    sync_schema ───────┼─────────────────────────────┼─> refresh_semantic_layer
+                       └─> load_communes_reference ──┘
 
 * ``download_dvf_file``: streams ``{DVF_BASE_URL}/{year}/full.csv.gz`` to the
   local ``data/`` volume in 1 MiB chunks. It writes to a ``.part`` file and
@@ -16,6 +17,9 @@ data.gouv.fr) into a LIST-partitioned PostgreSQL table, ``dvf.mutations``.
 * ``load_dvf_into_postgres``: reads the gzip file as a stream, cleans each
   record on the fly, and sends CHUNKS of rows to Postgres through an in-memory
   ``StringIO`` buffer and the native ``COPY ... FROM STDIN``.
+* ``load_communes_reference``: loads the official list of communes
+  (``DVF_COMMUNES_URL``: INSEE code, name, EPCI, population...) into
+  ``dvf.ref_communes``, so that every commune code has one canonical name.
 * ``refresh_semantic_layer``: rebuilds the query-facing objects of
   ``sql/semantic.sql`` (``dvf.ventes``, ``dvf.biens``...) from ``dvf.mutations``.
 
@@ -53,6 +57,7 @@ Configuration (Airflow Variables, read at RUN time, never at parse time)
     DVF_COPY_CHUNK_ROWS     50000
     DVF_MAX_REJECT_RATIO    0.001
     DVF_MAX_SHRINK_RATIO    0.2
+    DVF_COMMUNES_URL        communes-france-2026.csv.gz (data.gouv.fr)
 
 Trigger for a given year:
     airflow dags trigger dvf_postgres_pipeline -c '{"year": 2024}'
@@ -509,6 +514,72 @@ def download_file(url: str, destination: Path) -> dict[str, Any]:
 
 
 # =============================================================================
+# Reference: official list of communes ("Liste des communes de France", data.gouv.fr)
+# =============================================================================
+# Target column of dvf.ref_communes -> (source column, converter)
+COMMUNE_COLUMNS: dict[str, tuple[str, Callable[[str], Any]]] = {
+    "code_insee": ("code_insee", to_code_commune),
+    "nom": ("nom_standard", to_text),
+    "nom_sans_accent": ("nom_sans_accent", to_text),
+    "dep_code": ("dep_code", to_code_departement),
+    "epci_code": ("epci_code", to_text),
+    "epci_nom": ("epci_nom", to_text),
+    "code_postal": ("code_postal", to_text),
+    "population": ("population", to_int),
+    "superficie_km2": ("superficie_km2", to_decimal),
+    "densite": ("densite", to_decimal),
+    "latitude": ("latitude_centre", to_latitude),
+    "longitude": ("longitude_centre", to_longitude),
+    "grille_densite": ("grille_densite_texte", to_text),
+}
+MIN_COMMUNES = 30_000  # France has ~34 900 communes: fewer means a truncated file
+
+
+def iter_communes(lines: Iterable[str], stats: LoadStats) -> Iterator[list[Any]]:
+    """Yield one typed row per commune, in COMMUNE_COLUMNS order.
+
+    A missing source column fails fast; a row whose code, name or department
+    can't be read is rejected, other unreadable values become NULL.
+    """
+    reader = csv.DictReader(lines)
+    missing = [
+        src
+        for src, _ in COMMUNE_COLUMNS.values()
+        if src not in (reader.fieldnames or [])
+    ]
+    if missing:
+        raise AirflowFailException(f"Communes schema drift: missing columns {missing}")
+    required = {"code_insee", "nom", "dep_code"}
+    for record in reader:
+        stats.rows_read += 1
+        row: list[Any] = []
+        try:
+            for target, (source, convert) in COMMUNE_COLUMNS.items():
+                try:
+                    value = convert(record[source] or "")
+                except ValueError:
+                    if target in required:
+                        raise
+                    stats.nulled[target] += 1
+                    value = None
+                if value is None and target in required:
+                    raise ValueError(f"{target} is required")
+                row.append(value)
+        except ValueError as exc:
+            stats.rows_rejected += 1
+            if stats.rows_rejected <= 10:
+                log.warning("Rejected commune %r: %s", record.get("code_insee"), exc)
+            continue
+        yield row
+
+
+def millesime_from_url(url: str) -> int | None:
+    """communes-france-2026.csv.gz -> 2026 (the edition of the list)."""
+    match = re.search(r"communes-france-(\d{4})", url)
+    return int(match.group(1)) if match else None
+
+
+# =============================================================================
 # DAG
 # =============================================================================
 default_args = {
@@ -684,7 +755,9 @@ def dvf_postgres_pipeline() -> None:
         return summary
 
     @task(execution_timeout=timedelta(minutes=30))
-    def refresh_semantic_layer(summary: dict[str, Any]) -> None:
+    def refresh_semantic_layer(
+        summary: dict[str, Any], communes: dict[str, Any]
+    ) -> None:
         """Task 4: rebuild sql/semantic.sql (derived views + reference tables)."""
         cfg = DvfConfig.from_airflow()
         ddl = (cfg.sql_dir / "semantic.sql").read_text(encoding="utf-8")
@@ -705,8 +778,59 @@ def dvf_postgres_pipeline() -> None:
             conn.close()
         log.info("Semantic layer rebuilt after loading %s", summary["year"])
 
+    @task(execution_timeout=timedelta(minutes=15))
+    def load_communes_reference(partition: str) -> dict[str, Any]:
+        """Task 5: replace dvf.ref_communes with the official list, atomically."""
+        cfg = DvfConfig.from_airflow()
+        source = download_file(cfg.communes_url, cfg.communes_path)
+        stats = LoadStats()
+        columns = ", ".join(COMMUNE_COLUMNS) + ", millesime"
+        millesime = millesime_from_url(cfg.communes_url)
+        hook = PostgresHook(postgres_conn_id=cfg.conn_id)
+        conn = hook.get_conn()
+        try:
+            with conn.cursor() as cur:
+                # Parallel year loads all run this task: one at a time.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,)
+                )
+                cur.execute("TRUNCATE TABLE dvf.ref_communes")
+                with gzip.open(
+                    source["path"], "rt", encoding="utf-8", newline=""
+                ) as fh:
+                    rows = ([*row, millesime] for row in iter_communes(fh, stats))
+                    buffer = io.StringIO()
+                    csv.writer(buffer, lineterminator="\n").writerows(rows)
+                    copy_buffer(
+                        cur,
+                        f"COPY dvf.ref_communes ({columns}) FROM STDIN WITH (FORMAT csv)",
+                        buffer,
+                    )
+                cur.execute("SELECT count(*) FROM dvf.ref_communes")
+                (loaded,) = cur.fetchone()
+                if loaded < MIN_COMMUNES:
+                    raise AirflowFailException(
+                        f"Only {loaded:,} communes loaded (expected >= {MIN_COMMUNES:,})"
+                    )
+                check_format(stats, cfg.max_reject_ratio)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        summary = {
+            "communes": loaded,
+            "rejected": stats.rows_rejected,
+            "millesime": millesime,
+        }
+        log.info("Communes reference loaded: %s", summary)
+        return summary
+
+    partition = sync_schema()
     refresh_semantic_layer(
-        load_dvf_into_postgres(source=download_dvf_file(), partition=sync_schema())
+        load_dvf_into_postgres(source=download_dvf_file(), partition=partition),
+        load_communes_reference(partition),
     )
 
 

@@ -65,6 +65,8 @@ x-airflow-common: &airflow-common
     AIRFLOW_VAR_DVF_COPY_CHUNK_ROWS: "50000"
     AIRFLOW_VAR_DVF_MAX_REJECT_RATIO: "0.001"
     AIRFLOW_VAR_DVF_MAX_SHRINK_RATIO: "0.2"
+    # Official list of communes (one canonical name per INSEE code).
+    AIRFLOW_VAR_DVF_COMMUNES_URL: https://static.data.gouv.fr/resources/communes-et-villes-de-france-en-csv-excel-json-parquet-et-feather/20260617-160400/communes-france-2026.csv.gz
   volumes:
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs

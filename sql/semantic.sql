@@ -72,10 +72,74 @@ ON CONFLICT DO NOTHING;
 -- -----------------------------------------------------------------------------
 -- Derived objects: dropped and rebuilt (definition changes apply on next load)
 -- -----------------------------------------------------------------------------
--- dvf.ventes and dvf.communes are built from dvf.biens: drop dependents first.
-DROP VIEW IF EXISTS dvf.communes;
+-- dvf.ventes is built from dvf.biens, and both read names from dvf.communes:
+-- drop dependents first. Before the official list of communes, dvf.communes
+-- was a plain VIEW built ON dvf.ventes, so that old kind goes first.
+DO $$
+BEGIN
+    IF (SELECT relkind FROM pg_class WHERE oid = to_regclass('dvf.communes')) = 'v' THEN
+        DROP VIEW dvf.communes;
+    END IF;
+END
+$$;
 DROP MATERIALIZED VIEW IF EXISTS dvf.ventes;
 DROP MATERIALIZED VIEW IF EXISTS dvf.biens;
+DROP MATERIALIZED VIEW IF EXISTS dvf.communes;
+
+-- dvf.communes: ONE row and ONE canonical name per commune code of the scope.
+-- Names come from the official list (dvf.ref_communes); a code missing from it
+-- (a commune merged since, e.g. 33409 Saint-Genis-du-Bois) keeps its DVF name.
+-- Postal codes come from DVF itself: the official list also holds CEDEX codes
+-- (33001, 33012...), which look like INSEE codes and only cause confusion.
+CREATE MATERIALIZED VIEW dvf.communes AS
+WITH dvf_noms AS (
+    SELECT DISTINCT ON (code_commune) code_commune, nom_commune
+    FROM (SELECT code_commune, nom_commune, count(*) AS n
+          FROM dvf.mutations WHERE code_departement = '33'  -- SCOPE
+          GROUP BY 1, 2) AS t
+    ORDER BY code_commune, n DESC, nom_commune
+),
+postaux AS (
+    SELECT code_commune, array_agg(DISTINCT code_postal ORDER BY code_postal) AS codes_postaux
+    FROM dvf.mutations
+    WHERE code_departement = '33' AND code_postal IS NOT NULL  -- SCOPE
+    GROUP BY code_commune
+),
+ref AS (
+    SELECT * FROM dvf.ref_communes WHERE dep_code = '33'  -- SCOPE
+)
+SELECT
+    coalesce(r.code_insee, d.code_commune)                        AS code_commune,
+    coalesce(r.nom, d.nom_commune)                                AS nom_commune,
+    CASE WHEN d.nom_commune <> r.nom THEN d.nom_commune END       AS nom_dans_dvf,
+    coalesce(r.nom_sans_accent, lower(d.nom_commune))             AS nom_sans_accent,
+    pc.codes_postaux,
+    r.epci_code,
+    r.epci_nom,
+    r.population,
+    r.superficie_km2,
+    r.densite,
+    r.grille_densite,
+    r.latitude,
+    r.longitude
+FROM ref AS r
+FULL JOIN dvf_noms AS d ON d.code_commune = r.code_insee
+LEFT JOIN postaux AS pc ON pc.code_commune = coalesce(r.code_insee, d.code_commune);
+
+COMMENT ON MATERIALIZED VIEW dvf.communes IS
+    'Communes of the scope (Gironde): one row and one canonical name per INSEE code. '
+    'Look up code_commune here, never type an INSEE code from memory. '
+    'Postal codes (codes_postaux) are NOT INSEE codes.';
+COMMENT ON COLUMN dvf.communes.code_commune IS 'INSEE code (5 characters), the key used by dvf.ventes and dvf.biens';
+COMMENT ON COLUMN dvf.communes.nom_commune IS 'Official current name (dvf.ventes and dvf.biens use the same)';
+COMMENT ON COLUMN dvf.communes.nom_dans_dvf IS 'Older name found in DVF rows when it differs (e.g. Cadillac)';
+COMMENT ON COLUMN dvf.communes.nom_sans_accent IS 'Lower-case name without accents, for fuzzy matching';
+COMMENT ON COLUMN dvf.communes.codes_postaux IS 'Postal codes seen in DVF for this commune';
+COMMENT ON COLUMN dvf.communes.epci_nom IS 'Intercommunality (e.g. Bordeaux Métropole)';
+COMMENT ON COLUMN dvf.communes.population IS 'Population (official list edition, see dvf.ref_communes)';
+COMMENT ON COLUMN dvf.communes.latitude IS 'Centre of the commune, WGS84';
+
+CREATE UNIQUE INDEX communes_code_idx ON dvf.communes (code_commune);
 
 -- dvf.biens: one row per deduplicated property (local) of a mutation.
 CREATE MATERIALIZED VIEW dvf.biens AS
@@ -108,7 +172,7 @@ SELECT
     l.date_mutation,
     l.nature_mutation,
     l.code_commune,
-    l.nom_commune,
+    coalesce(c.nom_commune, l.nom_commune) AS nom_commune,
     l.code_postal,
     l.adresse_numero,
     l.adresse_suffixe,
@@ -127,6 +191,7 @@ SELECT
     ST_Transform(l.geom, 2154)::geometry(Point, 2154) AS geom
 FROM signatures AS s
 JOIN lignes AS l ON l.annee = s.annee AND l.num_ligne_source = s.ligne
+LEFT JOIN dvf.communes AS c ON c.code_commune = l.code_commune
 CROSS JOIN LATERAL generate_series(1, s.n);
 
 COMMENT ON MATERIALIZED VIEW dvf.biens IS
@@ -149,7 +214,6 @@ mutation AS (
            count(*)                      AS nb_lignes,
            count(DISTINCT id_parcelle)   AS nb_parcelles,
            bool_or(lot1_numero IS NOT NULL) AS a_des_lots,
-           min(code_commune)             AS code_commune_min,
            min(num_ligne_source)         AS premiere_ligne,
            avg(longitude)                AS longitude_moy,
            avg(latitude)                 AS latitude_moy,
@@ -185,8 +249,11 @@ SELECT
     m.date_mutation,
     m.nature_mutation,
     m.valeur_fonciere,
-    coalesce((lo.principal).code_commune, m.code_commune_min)   AS code_commune,
-    coalesce((lo.principal).nom_commune, fl.nom_commune)        AS nom_commune,
+    -- code and name always describe the SAME commune: the main property's,
+    -- else the first DVF row's (a land-only sale over two communes used to
+    -- get the smallest code with another row's name).
+    coalesce((lo.principal).code_commune, fl.code_commune)      AS code_commune,
+    coalesce(cn.nom_commune, (lo.principal).nom_commune, fl.nom_commune) AS nom_commune,
     coalesce((lo.principal).code_postal, fl.code_postal)        AS code_postal,
     coalesce((lo.principal).adresse_numero, fl.adresse_numero)  AS adresse_numero,
     coalesce((lo.principal).adresse_nom_voie, fl.adresse_nom_voie) AS adresse_nom_voie,
@@ -225,6 +292,7 @@ SELECT
 FROM mutation AS m
 JOIN lignes AS fl ON fl.annee = m.annee AND fl.num_ligne_source = m.premiere_ligne
 LEFT JOIN locaux AS lo ON lo.id_mutation = m.id_mutation
+LEFT JOIN dvf.communes AS cn ON cn.code_commune = coalesce((lo.principal).code_commune, fl.code_commune)
 LEFT JOIN terrain AS te ON te.id_mutation = m.id_mutation
 CROSS JOIN LATERAL (
     SELECT
@@ -257,11 +325,6 @@ CREATE INDEX ventes_commune_annee_idx      ON dvf.ventes (code_commune, annee);
 CREATE INDEX ventes_annee_idx              ON dvf.ventes (annee);
 CREATE INDEX ventes_geom_idx               ON dvf.ventes USING gist (geom);
 
--- dvf.communes: name lookup (accents, articles, homonyms).
-CREATE VIEW dvf.communes AS
-SELECT code_commune, nom_commune, count(*) AS nb_mutations
-FROM dvf.ventes
-GROUP BY code_commune, nom_commune;
-
+ANALYZE dvf.communes;
 ANALYZE dvf.biens;
 ANALYZE dvf.ventes;

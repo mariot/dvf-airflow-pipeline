@@ -20,6 +20,13 @@ MIN_YEAR = 2014
 
 HTTP_TIMEOUT = (10, 300)  # (connect, read) seconds
 
+# "Liste des communes de France" (data.gouv.fr, Licence Ouverte 2.0), 2026 edition.
+COMMUNES_URL = (
+    "https://static.data.gouv.fr/resources/"
+    "communes-et-villes-de-france-en-csv-excel-json-parquet-et-feather/"
+    "20260617-160400/communes-france-2026.csv.gz"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class DvfConfig:
@@ -38,6 +45,7 @@ class DvfConfig:
     chunk_rows: int
     max_reject_ratio: float
     max_shrink_ratio: float
+    communes_url: str
 
     @classmethod
     def from_airflow(cls) -> DvfConfig:
@@ -55,6 +63,7 @@ class DvfConfig:
                 Variable.get("DVF_MAX_REJECT_RATIO", default="0.001")
             ),
             max_shrink_ratio=float(Variable.get("DVF_MAX_SHRINK_RATIO", default="0.2")),
+            communes_url=Variable.get("DVF_COMMUNES_URL", default=COMMUNES_URL),
         )
 
     def source_url(self, year: int) -> str:
@@ -62,3 +71,7 @@ class DvfConfig:
 
     def local_path(self, year: int) -> Path:
         return self.data_dir / str(year) / "full.csv.gz"
+
+    @property
+    def communes_path(self) -> Path:
+        return self.data_dir / "reference" / Path(self.communes_url).name

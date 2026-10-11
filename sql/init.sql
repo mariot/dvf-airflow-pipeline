@@ -148,6 +148,34 @@ $$;
 CREATE INDEX IF NOT EXISTS mutations_geom_idx ON dvf.mutations USING gist (geom);
 
 -- -----------------------------------------------------------------------------
+-- Official list of communes (all of France), replaced as a whole by the DAG
+-- task load_communes_reference. It gives every INSEE code ONE canonical name
+-- (DVF rows can carry an old name, e.g. Cadillac -> Cadillac-sur-Garonne),
+-- plus EPCI, population and area. The semantic layer reads it through
+-- dvf.communes.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dvf.ref_communes (
+    code_insee       VARCHAR(5)    PRIMARY KEY,
+    nom              TEXT          NOT NULL,
+    nom_sans_accent  TEXT,
+    dep_code         VARCHAR(3)    NOT NULL,
+    epci_code        VARCHAR(9),
+    epci_nom         TEXT,
+    code_postal      VARCHAR(5),               -- main postal code only
+    population       INTEGER,
+    superficie_km2   NUMERIC(10,2),
+    densite          NUMERIC(10,1),            -- inhabitants per km²
+    latitude         DOUBLE PRECISION,         -- centre of the commune (WGS84)
+    longitude        DOUBLE PRECISION,
+    grille_densite   TEXT,                     -- INSEE density grid label
+    millesime        SMALLINT                  -- edition of the list (e.g. 2026)
+);
+
+COMMENT ON TABLE dvf.ref_communes IS
+    'Official list of communes of France (data.gouv.fr "Liste des communes de France", '
+    'Licence Ouverte 2.0), loaded from DVF_COMMUNES_URL';
+
+-- -----------------------------------------------------------------------------
 -- Load audit trail: one row per successful (committed) load of a year.
 -- Written in the SAME transaction as the data, so it never lies.
 -- -----------------------------------------------------------------------------

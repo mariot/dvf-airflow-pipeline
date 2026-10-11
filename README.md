@@ -16,7 +16,7 @@ dags/
   dvf_change_detector.py     daily DAG: detects new/changed yearly files and triggers the loader
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
 sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log
-sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.lieux, dvf.zones
+sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.communes, dvf.lieux, dvf.zones
 docker/postgres/Dockerfile   postgres:16 + PostGIS 3 (arm64 and amd64)
 docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
 docker-compose.yaml          Postgres 16 + Airflow (api-server, scheduler/LocalExecutor, dag-processor)
@@ -95,8 +95,9 @@ transaction; every other year is left untouched (see *History* below).
 
 ```
 download_dvf_file ─┐
-                   ├─> load_dvf_into_postgres ─> refresh_semantic_layer
-sync_schema ───────┘
+                   ├─> load_dvf_into_postgres ───┐
+sync_schema ───────┼─────────────────────────────┼─> refresh_semantic_layer
+                   └─> load_communes_reference ──┘
 ```
 
 1. **download_dvf_file**: streams `{DVF_BASE_URL}/{year}/full.csv.gz` to disk in
@@ -118,7 +119,12 @@ sync_schema ───────┘
    every `DVF_COPY_CHUNK_ROWS` rows. The same transaction does
    `TRUNCATE partition` → COPY chunks → quality gates → `load_log` insert →
    `ANALYZE` → commit.
-4. **refresh_semantic_layer**: applies `sql/semantic.sql` under the same
+4. **load_communes_reference**: downloads the official list of communes
+   (`DVF_COMMUNES_URL`, data.gouv.fr "Liste des communes de France",
+   Licence Ouverte 2.0) and replaces `dvf.ref_communes` (~34 900 communes:
+   INSEE code, current name, EPCI, population, area, centre) in one
+   transaction. It refuses a list with fewer than 30 000 communes.
+5. **refresh_semantic_layer**: applies `sql/semantic.sql` under the same
    advisory lock (about 15 s for Gironde). See section 6.
 
 **Idempotency.** Any failure rolls back the whole year, which keeps its
@@ -209,6 +215,7 @@ and read at **run time**, not at parse time.
 | `DVF_COPY_CHUNK_ROWS` | `50000` | Rows per COPY / RAM bound |
 | `DVF_MAX_REJECT_RATIO` | `0.001` | Fails the load above 0.1% rejected rows, or 0.1% unparseable values in a column |
 | `DVF_MAX_SHRINK_RATIO` | `0.2` | Refuses to replace a year with a version more than 20% smaller |
+| `DVF_COMMUNES_URL` | `.../communes-france-2026.csv.gz` | Official list of communes; point it at a newer edition when one is published |
 
 Variables defined as env vars take precedence over the UI. To manage one in
 the UI, delete it from the compose file.
@@ -228,7 +235,7 @@ Gironde (change the `SCOPE` filter to widen them) and rebuilt after each load.
 | `dvf.biens` | 1 row per deduplicated property | "N appartements vendus", surfaces, pièces |
 | `dvf.lieux` | landmark | distances (Place de la Bourse, Gare Saint-Jean...) |
 | `dvf.zones` | (zone, commune) | Bordeaux Métropole, Bassin d'Arcachon |
-| `dvf.communes` | commune | name lookup |
+| `dvf.communes` | commune | one canonical name per INSEE code (official list), postal codes seen in DVF, EPCI, population |
 
 Traps the layer handles (all found in the data):
 
@@ -246,6 +253,11 @@ Traps the layer handles (all found in the data):
 - **Missing values** (Gironde 2024): 272 sales without coordinates (they drop
   out of spatial queries), 556 rows without price; surfaces and room counts
   are missing on <0.01% of house/apartment rows.
+- **Commune names.** DVF rows can carry an old name (Cadillac, now
+  Cadillac-sur-Garonne); `dvf.ventes`, `dvf.biens` and `dvf.communes` all use
+  the official current name, and a sale's code and name always come from the
+  same row. Postal codes come from DVF, not from the official list, whose
+  CEDEX codes (33001, 33012...) look like INSEE codes.
 - **Spatial.** `dvf.mutations.geom` is a WGS84 point (all of France, GiST
   indexed, generated from longitude/latitude). The semantic layer's `geom`
   columns are Lambert-93 (EPSG:2154): units are metres, so

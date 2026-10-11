@@ -259,10 +259,67 @@ def test_dags_folder_parses_like_the_dag_processor():
             "download_dvf_file": [],
             "sync_schema": [],
             "load_dvf_into_postgres": ["download_dvf_file", "sync_schema"],
-            "refresh_semantic_layer": ["load_dvf_into_postgres"],
+            "load_communes_reference": ["sync_schema"],
+            "refresh_semantic_layer": [
+                "load_communes_reference",
+                "load_dvf_into_postgres",
+            ],
         },
         "dvf_change_detector": {
             "detect_changes": [],
             "trigger_reload": ["detect_changes"],
         },
     }
+
+
+# ------------------------------------------------------------- communes list
+COMMUNES_HEADER = (
+    "code_insee,nom_standard,nom_sans_accent,typecom,dep_code,epci_code,epci_nom,"
+    "code_postal,codes_postaux,population,superficie_km2,densite,latitude_centre,"
+    "longitude_centre,grille_densite_texte\n"
+)
+COMMUNES_SAMPLE = (
+    "33063,Bordeaux,bordeaux,COM,33,243300316,Bordeaux Métropole,33000,"
+    '"33000, 33001, 33100",267991,50,5397.2001953125,44.857,-0.574,Grands centres urbains\n'
+    "2A004,Ajaccio,ajaccio,COM,2A,242010056,CA du Pays Ajaccien,20000,20000,"
+    "75000,82.03,914.3,41.93,8.74,Centres urbains intermédiaires\n"
+)
+
+
+def test_iter_communes_types_and_keeps_corsica_codes():
+    stats = dvf.LoadStats()
+    rows = list(
+        dvf.iter_communes([COMMUNES_HEADER, *COMMUNES_SAMPLE.splitlines(True)], stats)
+    )
+    assert [r[0] for r in rows] == ["33063", "2A004"]
+    bordeaux = dict(zip(dvf.COMMUNE_COLUMNS, rows[0]))
+    assert bordeaux["nom"] == "Bordeaux"
+    assert bordeaux["epci_nom"] == "Bordeaux Métropole"
+    assert bordeaux["population"] == 267991
+    assert bordeaux["densite"] == Decimal("5397.2001953125")
+    assert (bordeaux["latitude"], bordeaux["longitude"]) == (44.857, -0.574)
+    assert stats.rows_rejected == 0
+
+
+def test_iter_communes_rejects_a_row_without_a_valid_code():
+    stats = dvf.LoadStats()
+    bad = "3306,Nowhere,nowhere,COM,33,,,,,,,,,,\n"
+    rows = list(
+        dvf.iter_communes(
+            [COMMUNES_HEADER, bad, *COMMUNES_SAMPLE.splitlines(True)], stats
+        )
+    )
+    assert len(rows) == 2 and stats.rows_rejected == 1
+
+
+def test_iter_communes_schema_drift_fails_fast():
+    header = COMMUNES_HEADER.replace("nom_standard", "nom")
+    with pytest.raises(dvf.AirflowFailException, match="nom_standard"):
+        list(dvf.iter_communes([header], dvf.LoadStats()))
+
+
+def test_millesime_from_url():
+    assert (
+        dvf.millesime_from_url("https://x/20260617/communes-france-2026.csv.gz") == 2026
+    )
+    assert dvf.millesime_from_url("https://x/other.csv.gz") is None
