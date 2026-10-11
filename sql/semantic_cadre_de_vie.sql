@@ -137,3 +137,57 @@ COMMENT ON VIEW dvf.acces_adresses IS
     'One row per address (Base Adresse Nationale): WALKING minutes to the nearest school of each '
     'level (NULL beyond 30 min) and typical door-to-centre-of-Bordeaux minutes by walking + public '
     'transport (NULL beyond 90 min)';
+
+-- -----------------------------------------------------------------------------
+-- Fuzzy commune search: the way to turn what a user typed into a code_commune.
+-- -----------------------------------------------------------------------------
+-- 'Saint-Médard-d''Eyrans' -> 'saint medard d eyrans'; 'St Emilion' -> 'saint emilion'
+CREATE OR REPLACE FUNCTION dvf.normaliser_nom(nom text) RETURNS text
+LANGUAGE sql STABLE PARALLEL SAFE AS $fn$
+    SELECT btrim(regexp_replace(regexp_replace(regexp_replace(regexp_replace(
+               ' ' || lower(public.unaccent(coalesce(nom, ''))) || ' ',
+               '[-''’`.,()/]', ' ', 'g'),
+               '\s+', ' ', 'g'),
+               ' ste ', ' sainte ', 'g'),
+               ' st ', ' saint ', 'g'))
+$fn$;
+
+CREATE OR REPLACE FUNCTION dvf.sans_article(nom text) RETURNS text
+LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $fn$
+    SELECT regexp_replace(nom, '^(le|la|les|l) ', '')
+$fn$;
+
+CREATE OR REPLACE FUNCTION dvf.chercher_commune(recherche text)
+RETURNS TABLE (code_commune varchar, nom_commune text, correspondance text, score real)
+LANGUAGE sql STABLE AS $fn$
+    WITH q AS (
+        SELECT dvf.normaliser_nom(recherche) AS n, dvf.sans_article(dvf.normaliser_nom(recherche)) AS na
+    ), c AS (
+        SELECT c.code_commune, c.nom_commune,
+               dvf.normaliser_nom(c.nom_commune) AS n,
+               dvf.sans_article(dvf.normaliser_nom(c.nom_commune)) AS na,
+               dvf.sans_article(dvf.normaliser_nom(c.nom_dans_dvf)) AS na_dvf
+        FROM dvf.communes c
+    ), m AS (
+        SELECT c.code_commune, c.nom_commune,
+               CASE
+                   WHEN c.na = q.na OR c.na_dvf = q.na THEN 1   -- exact (accents, case, articles, St/Saint ignored)
+                   WHEN c.na LIKE q.na || ' %' THEN 2            -- starts with: 'saint medard' -> 3 communes
+                   WHEN similarity(c.na, q.na) >= 0.35 THEN 3    -- typo: 'bordeau', 'merignak'
+               END AS rang,
+               similarity(c.na, q.na) AS sim
+        FROM c, q
+    )
+    SELECT m.code_commune, m.nom_commune,
+           (ARRAY['exacte', 'debut du nom', 'approchante'])[m.rang] AS correspondance,
+           round((CASE m.rang WHEN 1 THEN 1 WHEN 2 THEN 0.9 ELSE m.sim END)::numeric, 2)::real AS score
+    FROM m
+    WHERE m.rang = (SELECT min(rang) FROM m)   -- only the best kind of match found
+    ORDER BY m.sim DESC, m.nom_commune
+    LIMIT 10
+$fn$;
+
+COMMENT ON FUNCTION dvf.chercher_commune(text) IS
+    'Fuzzy commune search: SELECT * FROM dvf.chercher_commune(''bordeau''). Ignores case, accents, '
+    'hyphens, apostrophes, St/Ste and leading articles; tolerates typos. Returns only the best kind '
+    'of match: exacte, else debut du nom (several rows = ambiguous: ask), else approchante.';

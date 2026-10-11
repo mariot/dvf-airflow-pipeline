@@ -37,6 +37,11 @@ $$;
 
 CREATE SCHEMA IF NOT EXISTS dvf;
 
+-- Fuzzy commune search (dvf.chercher_commune): trigram similarity and accent
+-- folding. Both are trusted extensions: the database owner creates them.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
 COMMENT ON SCHEMA dvf IS
     'DVF géolocalisées (Etalab) loaded by the Airflow DAG dvf_postgres_pipeline';
 
