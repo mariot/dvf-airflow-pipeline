@@ -28,7 +28,6 @@ Format
 """
 
 import csv
-import gzip
 import io
 import logging
 from collections.abc import Callable, Iterable, Iterator
@@ -44,6 +43,7 @@ from airflow.sdk.exceptions import AirflowFailException
 from dvf_io import (
     SCHEMA_ADVISORY_LOCK_ID,
     LoadStats,
+    apply_sql_file,
     check_format,
     copy_buffer,
     download_file,
@@ -52,6 +52,7 @@ from dvf_io import (
     to_decimal,
     to_int,
     to_text,
+    ungzip,
 )
 
 from dvf_common import HTTP_TIMEOUT, LOYERS_DAG_ID, DvfConfig
@@ -100,15 +101,11 @@ REQUIRED = {"code_insee", "dep_code", "loyer_m2"}
 
 
 def decode(raw: bytes) -> str:
-    """Bytes of a downloaded file -> text.
-
-    static.data.gouv.fr serves these .csv with Content-Encoding: gzip, and
-    download_file stores the bytes exactly as served: unzip when the gzip
-    magic number is there. The text is Windows-1252; UTF-8 is accepted too in
-    case a future edition switches.
+    """Bytes of a downloaded file -> text (gunzipped first: static.data.gouv.fr
+    serves these .csv with Content-Encoding: gzip). The text is Windows-1252;
+    UTF-8 is accepted too in case a future edition switches.
     """
-    if raw[:2] == b"\x1f\x8b":
-        raw = gzip.decompress(raw)
+    raw = ungzip(raw)
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -199,22 +196,7 @@ def dvf_loyers_pipeline() -> None:
     @task(execution_timeout=timedelta(minutes=10))
     def sync_schema() -> None:
         """Apply init.sql (idempotent), which creates dvf.ref_loyers."""
-        cfg = DvfConfig.from_airflow()
-        ddl = (cfg.sql_dir / "init.sql").read_text(encoding="utf-8")
-        hook = PostgresHook(postgres_conn_id=cfg.conn_id)
-        conn = hook.get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,)
-                )
-                cur.execute(ddl)
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        apply_sql_file(DvfConfig.from_airflow(), "init.sql")
 
     @task(execution_timeout=timedelta(minutes=5))
     def plan_editions() -> list[dict[str, Any]]:

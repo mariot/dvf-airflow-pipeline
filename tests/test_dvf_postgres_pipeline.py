@@ -265,6 +265,14 @@ def test_dags_folder_parses_like_the_dag_processor():
                 "load_dvf_into_postgres",
             ],
         },
+        "dvf_logement_pipeline": {
+            "sync_schema": [],
+            "plan_rpls": ["sync_schema"],
+            "load_rpls": ["plan_rpls"],
+            "load_lovac": ["sync_schema"],
+            "load_series_longues": ["sync_schema"],
+            "load_cdc": ["sync_schema"],
+        },
         "dvf_loyers_pipeline": {
             "sync_schema": [],
             "plan_editions": ["sync_schema"],

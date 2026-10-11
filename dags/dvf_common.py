@@ -15,6 +15,7 @@ from airflow.sdk import Variable
 LOADER_DAG_ID = "dvf_postgres_pipeline"
 DETECTOR_DAG_ID = "dvf_change_detector"
 LOYERS_DAG_ID = "dvf_loyers_pipeline"
+LOGEMENT_DAG_ID = "dvf_logement_pipeline"
 
 # 2014 is the first DVF year ever published. /latest only serves the last 5 years.
 MIN_YEAR = 2014
@@ -26,6 +27,12 @@ COMMUNES_URL = (
     "https://static.data.gouv.fr/resources/"
     "communes-et-villes-de-france-en-csv-excel-json-parquet-et-feather/"
     "20260617-160400/communes-france-2026.csv.gz"
+)
+# LOVAC's dataset name carries its last edition: update it when 2027 comes out.
+LOVAC_DATASET = "logements-vacants-du-parc-prive-par-commune-departement-region-france-de-2020-a-2026"
+SERIES_LONGUES_URL = (
+    "https://www.igedd.developpement-durable.gouv.fr/IMG/xls/"
+    "valeur-immobilier-1800-2020_cle2abd1f.xls"
 )
 
 
@@ -47,6 +54,9 @@ class DvfConfig:
     max_reject_ratio: float
     max_shrink_ratio: float
     communes_url: str
+    rpls_departements: tuple[str, ...]
+    lovac_dataset: str
+    series_longues_url: str
 
     @classmethod
     def from_airflow(cls) -> DvfConfig:
@@ -65,6 +75,15 @@ class DvfConfig:
             ),
             max_shrink_ratio=float(Variable.get("DVF_MAX_SHRINK_RATIO", default="0.2")),
             communes_url=Variable.get("DVF_COMMUNES_URL", default=COMMUNES_URL),
+            rpls_departements=tuple(
+                d.strip()
+                for d in Variable.get("DVF_RPLS_DEPARTEMENTS", default="33").split(",")
+                if d.strip()
+            ),
+            lovac_dataset=Variable.get("DVF_LOVAC_DATASET", default=LOVAC_DATASET),
+            series_longues_url=Variable.get(
+                "DVF_SERIES_LONGUES_URL", default=SERIES_LONGUES_URL
+            ),
         )
 
     def source_url(self, year: int) -> str:
@@ -72,6 +91,9 @@ class DvfConfig:
 
     def local_path(self, year: int) -> Path:
         return self.data_dir / str(year) / "full.csv.gz"
+
+    def reference_path(self, kind: str, name: str) -> Path:
+        return self.data_dir / kind / name
 
     def loyers_path(self, year: int, url: str) -> Path:
         return self.data_dir / "loyers" / str(year) / Path(url).name

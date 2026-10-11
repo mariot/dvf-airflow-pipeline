@@ -21,7 +21,9 @@
 # =============================================================================
 
 x-airflow-common: &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:3.3.2-python3.14}
+  # apache/airflow:3.3.2-python3.14 + xlrd (docker/airflow/Dockerfile)
+  build: ./docker/airflow
+  image: ${AIRFLOW_IMAGE_NAME:-dvf-airflow:3.3.2-python3.14}
   environment: &airflow-common-env
     # ---- Core ---------------------------------------------------------------
     AIRFLOW__CORE__EXECUTOR: LocalExecutor

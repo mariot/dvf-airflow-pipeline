@@ -29,6 +29,8 @@ dependencies = [
     # The exact version comes from the Airflow constraints file (7.0.2 for 3.3.2).
     "apache-airflow-providers-postgres",
     "requests",
+    # Reads the legacy .xls of the long series (also installed in docker/airflow).
+    "xlrd==2.0.2",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +40,8 @@ dev = [
     "ruff==0.16.10",
     "pytest>=8",
     "pre-commit>=4",
+    # Writes a small .xls fixture for the long-series parser test.
+    "xlwt",
 ]
 
 # -----------------------------------------------------------------------------

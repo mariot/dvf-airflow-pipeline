@@ -15,11 +15,13 @@ dags/
   dvf_postgres_pipeline.py   loader DAG: download -> schema sync -> streaming COPY
   dvf_change_detector.py     daily DAG: detects new/changed yearly files and triggers the loader
   dvf_loyers_pipeline.py     monthly DAG: rent indicators "Carte des loyers" for the DVF years
+  dvf_logement_pipeline.py   monthly DAG: social housing (RPLS), vacancy (LOVAC), long series, CDC costs
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
   dvf_io.py                  shared converters, COPY and download helpers (no DAG; .airflowignore)
 sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log, reference tables
 sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.communes, dvf.lieux, dvf.zones
 docker/postgres/Dockerfile   postgres:16 + PostGIS 3 (arm64 and amd64)
+docker/airflow/Dockerfile    apache/airflow:3.3.2-python3.14 + xlrd (reads the legacy .xls of the long series)
 docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
 docker-compose.yaml          Postgres 16 + Airflow (api-server, scheduler/LocalExecutor, dag-processor)
 tests/                       unit tests + DAG integrity test (run in CI)
@@ -246,6 +248,30 @@ the communes, so only the larger ones are reliable. Any reuse must credit
 Rents are not in the semantic layer yet: the text-to-SQL engine can't query
 them.
 
+### Housing reference data (`dvf_logement_pipeline`)
+
+```
+sync_schema ──┬─> plan_rpls ──> load_rpls (mapped: one per edition)
+              ├─> load_lovac
+              ├─> load_series_longues
+              └─> load_cdc
+```
+
+Each source replaces its own table (RPLS: its own edition) in one
+transaction, with the usual gates. Monthly; every source is annual.
+
+| Table | Source | Coverage | Traps |
+|---|---|---|---|
+| `dvf.ref_rpls` | RPLS, social housing stock (SDES, DiDo API), one row per dwelling | Gironde (`DVF_RPLS_DEPARTEMENTS`), 1 January 2022-2025 (none before 2022); ~117 000 dwellings | columns renamed between editions (`DEPCOM` / `DEPCOM_CODE`, IRIS 2022 / 2024): mapped by aliases; coordinates already Lambert-93, `geom` is generated |
+| `dvf.ref_lovac` | LOVAC, vacant private dwellings (DGFiP / Cerema) | commune, department, region, France; editions 2020-2026 | wide files unpivoted; `"s"` = statistical secret, stored NULL + `*_secret` flag (commune values don't add up: use the department level); thousands separators; a region column renamed (`longue_duree`); edition N ≈ 1 January N-1; **method break in 2025** (Gironde: 83 000 → 50 000 vacant); no private stock for 2026 |
+| `dvf.ref_series_longues` | IGEDD long series 1800-2020 (J. Friggit), legacy `.xls` | France, United States, United Kingdom; 45 series | amounts in EUR even before 1999 (1 EUR = 6.55957 FRF); indices on base 1 in 2000; recent values may be provisional (the red marking can't be read reliably) |
+| `dvf.ref_cdc_logement_social` | Caisse des Dépôts, median surfaces and cost prices of financed social housing | by **region** and signing year, 2018-2025 | Gironde only through Nouvelle-Aquitaine (75); renovation values missing for the last year |
+
+Formats: RPLS and CDC are `;` with decimal points; LOVAC is `;`,
+Windows-1252, with thousands separators. static.data.gouv.fr and the CDC API
+send plain `.csv` files gzip-compressed (`Content-Encoding: gzip`):
+`dvf_io.read_downloaded` gunzips by magic number, whatever the file name.
+
 ## 5. Configuration
 
 **Airflow Variables.** They're set as `AIRFLOW_VAR_*` in `docker-compose.yaml`
@@ -261,6 +287,9 @@ and read at **run time**, not at parse time.
 | `DVF_MAX_REJECT_RATIO` | `0.001` | Fails the load above 0.1% rejected rows, or 0.1% unparseable values in a column |
 | `DVF_MAX_SHRINK_RATIO` | `0.2` | Refuses to replace a year with a version more than 20% smaller |
 | `DVF_COMMUNES_URL` | `.../communes-france-2026.csv.gz` | Official list of communes; point it at a newer edition when one is published |
+| `DVF_RPLS_DEPARTEMENTS` | `33` | Departments of the RPLS download (comma-separated); the national file is ~5.4 M dwellings per edition |
+| `DVF_LOVAC_DATASET` | `logements-vacants-...-de-2020-a-2026` | data.gouv.fr slug of LOVAC; it carries the last edition, update it when a new one is published |
+| `DVF_SERIES_LONGUES_URL` | `.../valeur-immobilier-1800-2020_cle2abd1f.xls` | IGEDD long series workbook |
 
 Variables defined as env vars take precedence over the UI. To manage one in
 the UI, delete it from the compose file.

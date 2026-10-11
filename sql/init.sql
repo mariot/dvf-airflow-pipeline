@@ -211,6 +211,96 @@ COMMENT ON TABLE dvf.ref_loyers IS
     'Groupe SeLoger et de leboncoin';
 
 -- -----------------------------------------------------------------------------
+-- Housing reference data, loaded by the DAG dvf_logement_pipeline. Each table
+-- (or RPLS edition) is replaced as a whole. Not part of the semantic layer.
+-- -----------------------------------------------------------------------------
+
+-- RPLS: one row per social dwelling at 1 January of `millesime` (SDES).
+-- Scope: DVF_RPLS_DEPARTEMENTS (default Gironde). No dwelling identifier is
+-- published: num_ligne is the position in the downloaded file.
+CREATE TABLE IF NOT EXISTS dvf.ref_rpls (
+    millesime               SMALLINT      NOT NULL,   -- situation at 1 January
+    num_ligne               INTEGER       NOT NULL,
+    code_commune            VARCHAR(5)    NOT NULL,
+    nom_commune             TEXT,
+    code_postal             VARCHAR(5),
+    dep_code                VARCHAR(3),
+    epci_code               VARCHAR(9),
+    code_iris               VARCHAR(9),               -- IRIS 2024 (2022 for older editions)
+    qpv                     TEXT,                     -- in a priority neighbourhood (QPV)?
+    type_construction       TEXT,                     -- individuel | collectif
+    nb_pieces               SMALLINT,
+    surface_habitable       NUMERIC(8,2),             -- m²
+    annee_construction      SMALLINT,
+    annee_mise_en_location  SMALLINT,
+    financement             TEXT,                     -- initial financing (PLAI, PLUS, PLS...)
+    droit                   TEXT,
+    dpe_energie             TEXT,
+    dpe_ges                 TEXT,
+    epsg                    TEXT,
+    x                       NUMERIC(12,2),
+    y                       NUMERIC(12,2),
+    geom                    geometry(Point, 2154)
+        GENERATED ALWAYS AS (CASE WHEN epsg = '2154'
+                                  THEN ST_SetSRID(ST_MakePoint(x::float8, y::float8), 2154) END) STORED,
+    CONSTRAINT ref_rpls_pkey PRIMARY KEY (millesime, num_ligne)
+);
+COMMENT ON TABLE dvf.ref_rpls IS
+    'RPLS social housing stock (SDES, Licence Ouverte), one row per dwelling at 1 January of millesime';
+CREATE INDEX IF NOT EXISTS ref_rpls_commune_idx ON dvf.ref_rpls (code_commune, millesime);
+CREATE INDEX IF NOT EXISTS ref_rpls_geom_idx    ON dvf.ref_rpls USING gist (geom);
+
+-- LOVAC: vacant private dwellings, per edition and geographic level.
+-- NULL + *_secret = statistical secret ('s'): never a zero. Edition N mostly
+-- describes 1 January N-1; method break in 2025; no private stock for 2026.
+CREATE TABLE IF NOT EXISTS dvf.ref_lovac (
+    millesime                 SMALLINT  NOT NULL,
+    niveau                    TEXT      NOT NULL,   -- commune | departement | region | france
+    code                      TEXT      NOT NULL,   -- INSEE code of the level ('FR' for France)
+    libelle                   TEXT,
+    parc_prive                INTEGER,              -- private dwellings
+    vacants                   INTEGER,
+    vacants_secret            BOOLEAN   NOT NULL DEFAULT false,
+    vacants_plus_2ans         INTEGER,              -- vacant for more than two years
+    vacants_plus_2ans_secret  BOOLEAN   NOT NULL DEFAULT false,
+    CONSTRAINT ref_lovac_pkey PRIMARY KEY (millesime, niveau, code),
+    CONSTRAINT ref_lovac_niveau_chk CHECK (niveau IN ('commune', 'departement', 'region', 'france'))
+);
+COMMENT ON TABLE dvf.ref_lovac IS
+    'LOVAC vacant private dwellings (DGFiP / Cerema, Licence Ouverte), by edition and level';
+
+-- Long series 1800-2020 (IGEDD): one row per (country, series, year).
+CREATE TABLE IF NOT EXISTS dvf.ref_series_longues (
+    pays       TEXT              NOT NULL,   -- France | USA | United Kingdom (as in the source)
+    categorie  TEXT,
+    serie      TEXT              NOT NULL,   -- French label, with its unit
+    serie_en   TEXT,
+    source     TEXT,
+    annee      SMALLINT          NOT NULL,
+    valeur     DOUBLE PRECISION  NOT NULL,
+    CONSTRAINT ref_series_longues_pkey PRIMARY KEY (pays, serie, annee)
+);
+COMMENT ON TABLE dvf.ref_series_longues IS
+    'Long series 1800-2020 (IGEDD): amounts in EUR even before 1999 (1 EUR = 6.55957 FRF); '
+    'the latest years may be provisional';
+
+-- CDC: median surfaces and cost prices of financed social housing operations.
+CREATE TABLE IF NOT EXISTS dvf.ref_cdc_logement_social (
+    code_region                   VARCHAR(3)    NOT NULL,
+    region                        TEXT,
+    annee                         SMALLINT      NOT NULL,   -- signing year of the financing
+    construction_surface_m2       NUMERIC(8,1),             -- median useful surface per dwelling
+    construction_cout_m2          NUMERIC(10,1),            -- median cost price, EUR/m²
+    construction_cout_logement    NUMERIC(12,1),            -- median cost price, EUR per dwelling
+    rehabilitation_surface_m2     NUMERIC(8,1),
+    rehabilitation_cout_m2        NUMERIC(10,1),
+    rehabilitation_cout_logement  NUMERIC(12,1),
+    CONSTRAINT ref_cdc_logement_social_pkey PRIMARY KEY (code_region, annee)
+);
+COMMENT ON TABLE dvf.ref_cdc_logement_social IS
+    'Caisse des Dépôts: median surfaces and costs of financed social housing, by region and year';
+
+-- -----------------------------------------------------------------------------
 -- Load audit trail: one row per successful (committed) load of a year.
 -- Written in the SAME transaction as the data, so it never lies.
 -- -----------------------------------------------------------------------------

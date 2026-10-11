@@ -6,6 +6,7 @@ load statistics and the format gate, the driver-agnostic COPY, and the
 idempotent streaming download. Listed in .airflowignore.
 """
 
+import gzip
 import io
 import json
 import logging
@@ -22,9 +23,10 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk.exceptions import AirflowFailException
 
-from dvf_common import HTTP_TIMEOUT
+from dvf_common import HTTP_TIMEOUT, DvfConfig
 
 log = logging.getLogger(__name__)
 
@@ -238,3 +240,36 @@ def download_file(url: str, destination: Path) -> dict[str, Any]:
         "Downloaded %.1f MiB in %.1fs", written / 2**20, time.monotonic() - started
     )
     return {**remote, "path": str(destination), "downloaded": True}
+
+
+def apply_sql_file(cfg: DvfConfig, filename: str) -> None:
+    """Run one of the idempotent SQL files of DVF_SQL_DIR under the schema lock."""
+    ddl = (cfg.sql_dir / filename).read_text(encoding="utf-8")
+    hook = PostgresHook(postgres_conn_id=cfg.conn_id)
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,))
+            cur.execute(ddl)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def read_downloaded(path: str | Path) -> bytes:
+    """Bytes of a file saved by download_file, gunzipped if needed.
+
+    download_file keeps the bytes exactly as served (right for DVF's .csv.gz),
+    but static.data.gouv.fr and some APIs send plain .csv with
+    Content-Encoding: gzip, so the file on disk is gzip data: detect the
+    magic number instead of trusting the file name.
+    """
+    return ungzip(Path(path).read_bytes())
+
+
+def ungzip(raw: bytes) -> bytes:
+    """Gunzip when the gzip magic number is there, else return the bytes as is."""
+    return gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
