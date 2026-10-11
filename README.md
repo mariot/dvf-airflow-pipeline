@@ -14,8 +14,10 @@ with `uv`.
 dags/
   dvf_postgres_pipeline.py   loader DAG: download -> schema sync -> streaming COPY
   dvf_change_detector.py     daily DAG: detects new/changed yearly files and triggers the loader
+  dvf_loyers_pipeline.py     monthly DAG: rent indicators "Carte des loyers" for the DVF years
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
-sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log
+  dvf_io.py                  shared converters, COPY and download helpers (no DAG; .airflowignore)
+sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log, reference tables
 sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.communes, dvf.lieux, dvf.zones
 docker/postgres/Dockerfile   postgres:16 + PostGIS 3 (arm64 and amd64)
 docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
@@ -88,6 +90,14 @@ docker compose exec airflow-scheduler airflow dags trigger dvf_postgres_pipeline
 
 Re-running any year is safe. That year's partition is **replaced** in one
 transaction; every other year is left untouched (see *History* below).
+
+**Rents (`dvf.ref_loyers`):** loaded by `dvf_loyers_pipeline` for the years
+DVF covers. It also runs on the 2nd of every month and only replaces what
+changed.
+
+```bash
+docker compose exec airflow-scheduler airflow dags trigger dvf_loyers_pipeline
+```
 
 ## 4. How it works
 
@@ -200,6 +210,41 @@ To check freshness by hand:
 ```sql
 SELECT annee, source_last_modified, rows_loaded, loaded_at FROM dvf.v_load_status;
 ```
+
+### Rents (`dvf_loyers_pipeline`)
+
+```
+sync_schema ──> plan_editions ──> load_edition  (mapped: one per year)
+```
+
+Source: "Carte des loyers", indicators of advertised rents per commune
+(ANIL / ministry of housing, data.gouv.fr, Licence Ouverte 2.0). One dataset
+per edition, four files each: apartments, apartments with 1-2 rooms, 3+
+rooms, houses.
+
+1. **plan_editions** takes the DVF years already loaded and asks the
+   data.gouv.fr API for each year's dataset. There is **no 2021 edition** (the
+   series goes 2018, then 2022 onwards), so 2021 is logged and skipped:
+   rents cover 2022-2025.
+2. **load_edition** downloads the four files (ETag skip) and replaces that
+   year of `dvf.ref_loyers` in one transaction, with the same gates as DVF:
+   at least 30 000 communes per file, reject ratio and format drift.
+
+**Format trap.** These files are `;`-separated, with decimal **commas**, in
+Windows-1252, and static.data.gouv.fr serves them gzip-compressed
+(`Content-Encoding: gzip`). The loader handles all four.
+
+**What a value means.** `loyer_m2` is a *predicted* advertised rent in
+EUR/m², charges included, for an unfurnished reference property (apartment
+52 m², house 92 m²) advertised in Q3 of `annee`. It is neither a median nor a
+mean. **Editions are not comparable over time**: the groups of communes used
+for the estimate change every year. Treat a value with caution when
+`nb_obs_commune < 30` or `r2_ajuste < 0.5`; in Gironde that is about 70% of
+the communes, so only the larger ones are reliable. Any reuse must credit
+"Estimations ANIL, à partir des données du Groupe SeLoger et de leboncoin".
+
+Rents are not in the semantic layer yet: the text-to-SQL engine can't query
+them.
 
 ## 5. Configuration
 

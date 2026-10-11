@@ -176,6 +176,41 @@ COMMENT ON TABLE dvf.ref_communes IS
     'Licence Ouverte 2.0), loaded from DVF_COMMUNES_URL';
 
 -- -----------------------------------------------------------------------------
+-- Rent indicators "Carte des loyers" (ANIL / ministry of housing), one row per
+-- (edition year, segment, commune), all of France. Loaded by the DAG
+-- dvf_loyers_pipeline for the DVF years (no edition exists for 2021).
+-- loyer_m2 is a PREDICTED advertised rent, EUR/m², charges included, for an
+-- unfurnished reference property advertised in Q3 of `annee`: not a median nor
+-- a mean, and editions are NOT comparable over time (mailles change yearly).
+-- Credit required: "Estimations ANIL, à partir des données du Groupe SeLoger
+-- et de leboncoin".
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dvf.ref_loyers (
+    annee              SMALLINT      NOT NULL,   -- edition = ads of Q3 of that year
+    segment            TEXT          NOT NULL,   -- appartement | appartement_1_2_pieces | appartement_3_pieces_plus | maison
+    code_insee         VARCHAR(5)    NOT NULL,
+    nom_commune        TEXT,
+    dep_code           VARCHAR(3)    NOT NULL,
+    epci_code          VARCHAR(9),
+    id_maille          TEXT,                     -- group of communes used for the estimate
+    loyer_m2           NUMERIC(8,2)  NOT NULL,   -- EUR/m², charges included
+    loyer_m2_bas       NUMERIC(8,2),             -- 95% prediction interval
+    loyer_m2_haut      NUMERIC(8,2),
+    niveau_prediction  TEXT,                     -- commune | epci | maille
+    nb_obs_commune     INTEGER,                  -- ads seen in the commune (< 30 = unreliable)
+    nb_obs_maille      INTEGER,
+    r2_ajuste          NUMERIC(6,4),             -- < 0.5 = unreliable
+    CONSTRAINT ref_loyers_pkey PRIMARY KEY (annee, segment, code_insee),
+    CONSTRAINT ref_loyers_segment_chk CHECK (segment IN (
+        'appartement', 'appartement_1_2_pieces', 'appartement_3_pieces_plus', 'maison'))
+);
+
+COMMENT ON TABLE dvf.ref_loyers IS
+    'Carte des loyers (ANIL): predicted advertised rent EUR/m² per commune, Q3 of annee. '
+    'Not comparable across years. Credit: Estimations ANIL, à partir des données du '
+    'Groupe SeLoger et de leboncoin';
+
+-- -----------------------------------------------------------------------------
 -- Load audit trail: one row per successful (committed) load of a year.
 -- Written in the SAME transaction as the data, so it never lies.
 -- -----------------------------------------------------------------------------

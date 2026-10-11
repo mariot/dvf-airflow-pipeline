@@ -265,6 +265,11 @@ def test_dags_folder_parses_like_the_dag_processor():
                 "load_dvf_into_postgres",
             ],
         },
+        "dvf_loyers_pipeline": {
+            "sync_schema": [],
+            "plan_editions": ["sync_schema"],
+            "load_edition": ["plan_editions"],
+        },
         "dvf_change_detector": {
             "detect_changes": [],
             "trigger_reload": ["detect_changes"],

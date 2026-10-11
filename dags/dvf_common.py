@@ -14,6 +14,7 @@ from airflow.sdk import Variable
 
 LOADER_DAG_ID = "dvf_postgres_pipeline"
 DETECTOR_DAG_ID = "dvf_change_detector"
+LOYERS_DAG_ID = "dvf_loyers_pipeline"
 
 # 2014 is the first DVF year ever published. /latest only serves the last 5 years.
 MIN_YEAR = 2014
@@ -71,6 +72,9 @@ class DvfConfig:
 
     def local_path(self, year: int) -> Path:
         return self.data_dir / str(year) / "full.csv.gz"
+
+    def loyers_path(self, year: int, url: str) -> Path:
+        return self.data_dir / "loyers" / str(year) / Path(url).name
 
     @property
     def communes_path(self) -> Path:
