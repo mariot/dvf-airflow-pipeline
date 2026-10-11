@@ -37,7 +37,8 @@ echo "[initdb] enabling PostGIS in '${DVF_DB_NAME}'"
 psql -v ON_ERROR_STOP=1 \
      --username "${POSTGRES_USER}" \
      --dbname "${DVF_DB_NAME}" \
-     --command "CREATE EXTENSION IF NOT EXISTS postgis"
+     --command "CREATE EXTENSION IF NOT EXISTS postgis" \
+     --command "CREATE EXTENSION IF NOT EXISTS pgrouting"
 
 echo "[initdb] applying /sql/init.sql to '${DVF_DB_NAME}' as '${DVF_DB_USER}'"
 

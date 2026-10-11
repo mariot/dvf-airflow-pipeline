@@ -265,6 +265,20 @@ def test_dags_folder_parses_like_the_dag_processor():
                 "load_dvf_into_postgres",
             ],
         },
+        "dvf_accessibilite_pipeline": {
+            "sync_schema": [],
+            "load_contours": ["sync_schema"],
+            "load_walking_graph": ["load_contours"],
+            "load_schools": ["load_contours"],
+            "load_addresses": ["load_contours"],
+            "load_transport": ["load_contours"],
+            "compute_access": [
+                "load_addresses",
+                "load_schools",
+                "load_transport",
+                "load_walking_graph",
+            ],
+        },
         "dvf_logement_pipeline": {
             "sync_schema": [],
             "plan_rpls": ["sync_schema"],

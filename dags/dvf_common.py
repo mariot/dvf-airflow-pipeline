@@ -7,6 +7,7 @@ register its DAG twice (AirflowDagDuplicatedIdException). It plays the role of
 so the dag-processor doesn't parse it on its own.
 """
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ LOADER_DAG_ID = "dvf_postgres_pipeline"
 DETECTOR_DAG_ID = "dvf_change_detector"
 LOYERS_DAG_ID = "dvf_loyers_pipeline"
 LOGEMENT_DAG_ID = "dvf_logement_pipeline"
+ACCES_DAG_ID = "dvf_accessibilite_pipeline"
 
 # 2014 is the first DVF year ever published. /latest only serves the last 5 years.
 MIN_YEAR = 2014
@@ -30,6 +32,16 @@ COMMUNES_URL = (
 )
 # LOVAC's dataset name carries its last edition: update it when 2027 comes out.
 LOVAC_DATASET = "logements-vacants-du-parc-prive-par-commune-departement-region-france-de-2020-a-2026"
+# Walking graph: Geofabrik extract containing the scope departments.
+OSM_PBF_URL = "https://download.geofabrik.de/europe/france/aquitaine-latest.osm.pbf"
+# Public transport (transport.data.gouv.fr), network name -> GTFS zip.
+GTFS_FEEDS = {
+    "tbm": "https://bdx.mecatran.com/utw/ws/gtfsfeed/static/bordeaux"
+    "?apiKey=opendata-bordeaux-metropole-flux-gtfs-rt",
+    "transgironde": "https://www.pigma.org/public/opendata/nouvelle_aquitaine_mobilites/"
+    "publication/gironde-aggregated-gtfs.zip",
+    "sncf": "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip",
+}
 SERIES_LONGUES_URL = (
     "https://www.igedd.developpement-durable.gouv.fr/IMG/xls/"
     "valeur-immobilier-1800-2020_cle2abd1f.xls"
@@ -57,6 +69,9 @@ class DvfConfig:
     rpls_departements: tuple[str, ...]
     lovac_dataset: str
     series_longues_url: str
+    scope_departements: tuple[str, ...]
+    osm_pbf_url: str
+    gtfs_feeds: tuple[tuple[str, str], ...]
 
     @classmethod
     def from_airflow(cls) -> DvfConfig:
@@ -83,6 +98,18 @@ class DvfConfig:
             lovac_dataset=Variable.get("DVF_LOVAC_DATASET", default=LOVAC_DATASET),
             series_longues_url=Variable.get(
                 "DVF_SERIES_LONGUES_URL", default=SERIES_LONGUES_URL
+            ),
+            scope_departements=tuple(
+                d.strip()
+                for d in Variable.get("DVF_SCOPE_DEPARTEMENTS", default="33").split(",")
+                if d.strip()
+            ),
+            osm_pbf_url=Variable.get("DVF_OSM_PBF_URL", default=OSM_PBF_URL),
+            gtfs_feeds=tuple(
+                (name, url)
+                for name, url in json.loads(
+                    Variable.get("DVF_GTFS_FEEDS", default=json.dumps(GTFS_FEEDS))
+                ).items()
             ),
         )
 

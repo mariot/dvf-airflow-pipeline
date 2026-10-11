@@ -16,12 +16,14 @@ dags/
   dvf_change_detector.py     daily DAG: detects new/changed yearly files and triggers the loader
   dvf_loyers_pipeline.py     monthly DAG: rent indicators "Carte des loyers" for the DVF years
   dvf_logement_pipeline.py   monthly DAG: social housing (RPLS), vacancy (LOVAC), long series, CDC costs
+  dvf_accessibilite_pipeline.py  monthly DAG: walking graph (OSM + pgRouting), schools, transport, addresses
+  dvf_osm.py / dvf_transit.py    OSM -> walking graph; GTFS -> transit times (no DAG; .airflowignore)
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
   dvf_io.py                  shared converters, COPY and download helpers (no DAG; .airflowignore)
 sql/init.sql                 idempotent DDL: partitioned table (+ PostGIS geom), audit log, reference tables
 sql/semantic.sql             semantic layer rebuilt after each load: dvf.ventes, dvf.biens, dvf.communes, dvf.lieux, dvf.zones
-docker/postgres/Dockerfile   postgres:16 + PostGIS 3 (arm64 and amd64)
-docker/airflow/Dockerfile    apache/airflow:3.3.2-python3.14 + xlrd (reads the legacy .xls of the long series)
+docker/postgres/Dockerfile   postgres:16 + PostGIS 3 + pgRouting (arm64 and amd64)
+docker/airflow/Dockerfile    apache/airflow:3.3.2-python3.14 + xlrd (legacy .xls) + osmium (OpenStreetMap)
 docker/postgres/initdb/      first-boot script: creates the dvf role + database, enables PostGIS
 docker-compose.yaml          Postgres 16 + Airflow (api-server, scheduler/LocalExecutor, dag-processor)
 tests/                       unit tests + DAG integrity test (run in CI)
@@ -272,6 +274,50 @@ Windows-1252, with thousands separators. static.data.gouv.fr and the CDC API
 send plain `.csv` files gzip-compressed (`Content-Encoding: gzip`):
 `dvf_io.read_downloaded` gunzips by magic number, whatever the file name.
 
+### Accessibility for a home search (`dvf_accessibilite_pipeline`)
+
+```
+sync_schema ──> load_contours ──┬─> load_walking_graph ──┐
+                                ├─> load_schools ────────┤
+                                ├─> load_addresses ──────┼─> compute_access
+                                └─> load_transport ──────┘
+```
+
+Scope: `DVF_SCOPE_DEPARTEMENTS` (default `33`). Every source is national;
+the walking graph is what limits the scale on a laptop.
+
+- **Walking graph** (`dvf.osm_pieton`, `dvf.osm_pieton_noeuds`): OpenStreetMap
+  (Geofabrik extract), ways a pedestrian may use (no motorways, no
+  `foot=no` / private), split at every shared node, so OSM node ids are the
+  pgRouting vertices. Cost: seconds at 4.5 km/h, steps count double. Gironde:
+  ~430 000 segments, ~325 000 vertices; vertices of components smaller than
+  1 000 vertices are not used for snapping.
+- **Schools** (`dvf.ref_ecoles`, `dvf.ref_ecoles_ips`, `dvf.ref_colleges_ivac`):
+  annuaire de l'éducation, social position index (IPS: a social profile, not a
+  quality score; "NS" = too small to publish -> NULL), collège value added.
+  SEGPA sections, sections attached to a lycée and schools without pupils are
+  kept but never count as "the nearest school"; "lycée" means general,
+  technological or multi-track.
+- **Addresses** (`dvf.ref_adresses`): Base Adresse Nationale, with their
+  cadastral parcels (same ids as DVF `id_parcelle`).
+- **Public transport** (`dvf.transport_arrets`, `dvf.transport_temps_pole`):
+  GTFS of TBM, TransGironde and SNCF (`DVF_GTFS_FEEDS`). pgRouting can't follow
+  timetables, so a backward connection scan (`dvf_transit.py`) computes, for
+  every stop, the time to each pole of `dvf.acces_poles` (default: Centre de
+  Bordeaux, Grand Théâtre) for arrivals between 07:30 and 09:00 on a reference
+  Tuesday: best case and **typical** (median over 46 deadlines). The wait
+  before the first departure is not counted.
+- **compute_access**, in pgRouting: snap schools, stops and addresses to the
+  nearest vertex; one multi-source `pgr_drivingDistance(..., equicost)` per
+  school level (capped at 30 min); one search from a virtual vertex linked to
+  every stop (cost = its typical transit time) and to the pole (walking only),
+  capped at 90 min, gives door-to-centre time for every vertex.
+
+`dvf.v_acces_adresses` gives, per address, the walking minutes to the nearest
+maternelle, élémentaire, collège and lycée, and the typical door-to-centre
+minutes. In Gironde, 60% of addresses have an elementary school within 15 min
+on foot, and 8.6% are within 30 min of the centre of Bordeaux.
+
 ## 5. Configuration
 
 **Airflow Variables.** They're set as `AIRFLOW_VAR_*` in `docker-compose.yaml`
@@ -289,6 +335,9 @@ and read at **run time**, not at parse time.
 | `DVF_COMMUNES_URL` | `.../communes-france-2026.csv.gz` | Official list of communes; point it at a newer edition when one is published |
 | `DVF_RPLS_DEPARTEMENTS` | `33` | Departments of the RPLS download (comma-separated); the national file is ~5.4 M dwellings per edition |
 | `DVF_LOVAC_DATASET` | `logements-vacants-...-de-2020-a-2026` | data.gouv.fr slug of LOVAC; it carries the last edition, update it when a new one is published |
+| `DVF_SCOPE_DEPARTEMENTS` | `33` | Departments of the accessibility data (outlines, graph, schools, addresses, stops) |
+| `DVF_OSM_PBF_URL` | Geofabrik `aquitaine-latest.osm.pbf` | OpenStreetMap extract containing the scope |
+| `DVF_GTFS_FEEDS` | TBM, TransGironde, SNCF | JSON `{"network": "gtfs zip url"}` |
 | `DVF_SERIES_LONGUES_URL` | `.../valeur-immobilier-1800-2020_cle2abd1f.xls` | IGEDD long series workbook |
 
 Variables defined as env vars take precedence over the UI. To manage one in

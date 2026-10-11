@@ -301,6 +301,168 @@ COMMENT ON TABLE dvf.ref_cdc_logement_social IS
     'Caisse des Dépôts: median surfaces and costs of financed social housing, by region and year';
 
 -- -----------------------------------------------------------------------------
+-- Accessibility (DAG dvf_accessibilite_pipeline): walking graph, schools,
+-- public transport, addresses, and walking / door-to-pole times. Scope:
+-- DVF_SCOPE_DEPARTEMENTS (default Gironde). Not part of the semantic layer.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS dvf.ref_communes_contours (
+    code_commune  VARCHAR(5) PRIMARY KEY,
+    nom           TEXT,
+    dep_code      VARCHAR(3),
+    geom          geometry(MultiPolygon, 2154) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ref_communes_contours_geom_idx ON dvf.ref_communes_contours USING gist (geom);
+
+-- Walking graph from OpenStreetMap: vertices are OSM node ids.
+CREATE TABLE IF NOT EXISTS dvf.osm_pieton (
+    id          BIGINT PRIMARY KEY,
+    osm_id      BIGINT NOT NULL,
+    source      BIGINT NOT NULL,
+    target      BIGINT NOT NULL,
+    highway     TEXT,
+    longueur_m  DOUBLE PRECISION NOT NULL,
+    cout_s      DOUBLE PRECISION NOT NULL,   -- walking seconds at 4.5 km/h (steps x2)
+    geom        geometry(LineString, 2154) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS osm_pieton_source_idx ON dvf.osm_pieton (source);
+CREATE INDEX IF NOT EXISTS osm_pieton_target_idx ON dvf.osm_pieton (target);
+CREATE INDEX IF NOT EXISTS osm_pieton_geom_idx ON dvf.osm_pieton USING gist (geom);
+
+CREATE TABLE IF NOT EXISTS dvf.osm_pieton_noeuds (
+    id          BIGINT PRIMARY KEY,
+    composante  BIGINT,                      -- connected component (pgr_connectedComponents)
+    principal   BOOLEAN NOT NULL DEFAULT false,  -- in a component big enough to snap to
+    geom        geometry(Point, 2154) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS osm_pieton_noeuds_geom_idx ON dvf.osm_pieton_noeuds USING gist (geom);
+CREATE INDEX IF NOT EXISTS osm_pieton_noeuds_principal_idx
+    ON dvf.osm_pieton_noeuds USING gist (geom) WHERE principal;
+
+-- Schools (annuaire de l'éducation), with their social and value-added indicators.
+CREATE TABLE IF NOT EXISTS dvf.ref_ecoles (
+    uai                   VARCHAR(8) PRIMARY KEY,
+    nom                   TEXT,
+    type                  TEXT NOT NULL,      -- ecole | college | lycee
+    maternelle            BOOLEAN,
+    elementaire           BOOLEAN,
+    lycee_general         BOOLEAN,
+    statut                TEXT,               -- Public | Privé
+    education_prioritaire TEXT,               -- REP | REP+ | NULL
+    code_commune          VARCHAR(5),
+    nom_commune           TEXT,
+    adresse               TEXT,
+    geom                  geometry(Point, 2154),
+    noeud                 BIGINT              -- nearest walking-graph vertex
+);
+ALTER TABLE dvf.ref_ecoles ADD COLUMN IF NOT EXISTS code_nature VARCHAR(3);  -- 340 collège, 390 SEGPA...
+ALTER TABLE dvf.ref_ecoles ADD COLUMN IF NOT EXISTS nature TEXT;
+CREATE INDEX IF NOT EXISTS ref_ecoles_geom_idx ON dvf.ref_ecoles USING gist (geom);
+
+CREATE TABLE IF NOT EXISTS dvf.ref_ecoles_ips (
+    uai                VARCHAR(8) NOT NULL,
+    rentree            TEXT NOT NULL,         -- '2024-2025'
+    niveau             TEXT NOT NULL,         -- ecole | college
+    ips                NUMERIC(6,1),          -- social position index (national mean ~100)
+    ips_departemental  NUMERIC(6,1),
+    ecart_type         NUMERIC(6,1),
+    CONSTRAINT ref_ecoles_ips_pkey PRIMARY KEY (uai, rentree)
+);
+COMMENT ON TABLE dvf.ref_ecoles_ips IS
+    'Indice de position sociale (Education nationale): higher = more favoured families; not a quality score';
+
+CREATE TABLE IF NOT EXISTS dvf.ref_colleges_ivac (
+    uai                     VARCHAR(8) NOT NULL,
+    session                 SMALLINT NOT NULL,
+    nb_candidats            INTEGER,
+    taux_reussite           NUMERIC(5,1),     -- brevet, général series
+    va_taux_reussite        NUMERIC(5,1),     -- value added: + = better than expected for its pupils
+    note_ecrit              NUMERIC(5,1),
+    va_note_ecrit           NUMERIC(5,1),
+    taux_acces_6e_3e        NUMERIC(5,1),
+    CONSTRAINT ref_colleges_ivac_pkey PRIMARY KEY (uai, session)
+);
+
+-- Public transport stops (GTFS) and their time to each pole.
+CREATE TABLE IF NOT EXISTS dvf.transport_arrets (
+    arret     TEXT PRIMARY KEY,               -- '<network>:<stop_id>'
+    reseau    TEXT NOT NULL,
+    nom       TEXT,
+    modes     TEXT[],                         -- tram | bus | train | ferry...
+    geom      geometry(Point, 2154) NOT NULL,
+    noeud     BIGINT
+);
+CREATE INDEX IF NOT EXISTS transport_arrets_geom_idx ON dvf.transport_arrets USING gist (geom);
+
+CREATE TABLE IF NOT EXISTS dvf.acces_poles (
+    pole              TEXT PRIMARY KEY,
+    geom              geometry(Point, 2154) NOT NULL,
+    arrivee_debut     TIME NOT NULL DEFAULT '07:30',   -- arrival window on the reference day
+    arrivee_fin       TIME NOT NULL DEFAULT '09:00'
+);
+INSERT INTO dvf.acces_poles (pole, geom)
+VALUES ('Centre de Bordeaux', ST_Transform(ST_SetSRID(ST_MakePoint(-0.57451, 44.84246), 4326), 2154))
+ON CONFLICT DO NOTHING;
+COMMENT ON TABLE dvf.acces_poles IS 'Destinations of the door-to-pole times (Centre de Bordeaux = Grand Théâtre)';
+
+CREATE TABLE IF NOT EXISTS dvf.transport_temps_pole (
+    arret              TEXT NOT NULL,
+    pole               TEXT NOT NULL,
+    minutes_meilleur   NUMERIC(5,1) NOT NULL,  -- best case over the arrival window
+    minutes_typique    NUMERIC(5,1) NOT NULL,  -- median over the arrival window
+    jour_reference     DATE NOT NULL,
+    CONSTRAINT transport_temps_pole_pkey PRIMARY KEY (arret, pole)
+);
+
+-- Addresses (Base Adresse Nationale).
+CREATE TABLE IF NOT EXISTS dvf.ref_adresses (
+    id             TEXT PRIMARY KEY,
+    numero         INTEGER,
+    rep            TEXT,
+    nom_voie       TEXT,
+    code_postal    VARCHAR(5),
+    code_commune   VARCHAR(5) NOT NULL,
+    nom_commune    TEXT,
+    parcelles      TEXT[],                    -- cadastral parcels (same ids as DVF id_parcelle)
+    geom           geometry(Point, 2154) NOT NULL,
+    noeud          BIGINT,
+    acces_m        DOUBLE PRECISION           -- straight distance address -> vertex
+);
+CREATE INDEX IF NOT EXISTS ref_adresses_geom_idx ON dvf.ref_adresses USING gist (geom);
+CREATE INDEX IF NOT EXISTS ref_adresses_commune_idx ON dvf.ref_adresses (code_commune);
+
+-- Walking minutes from each vertex to the nearest school of each level, and
+-- door-to-pole minutes (walk + public transport, or walk only).
+CREATE TABLE IF NOT EXISTS dvf.acces_noeuds (
+    noeud                  BIGINT PRIMARY KEY,
+    min_maternelle         NUMERIC(5,1),  uai_maternelle   VARCHAR(8),
+    min_elementaire        NUMERIC(5,1),  uai_elementaire  VARCHAR(8),
+    min_college            NUMERIC(5,1),  uai_college      VARCHAR(8),
+    min_lycee              NUMERIC(5,1),  uai_lycee        VARCHAR(8)
+);
+CREATE TABLE IF NOT EXISTS dvf.acces_noeuds_poles (
+    noeud    BIGINT NOT NULL,
+    pole     TEXT NOT NULL,
+    minutes  NUMERIC(5,1) NOT NULL,           -- typical door-to-pole time
+    CONSTRAINT acces_noeuds_poles_pkey PRIMARY KEY (noeud, pole)
+);
+
+-- One row per address: walking minutes to the nearest school of each level
+-- (<= 30 min, else NULL) and typical door-to-centre minutes (<= 90 min),
+-- including the short walk from the address to its graph vertex.
+CREATE OR REPLACE VIEW dvf.v_acces_adresses AS
+SELECT a.id, a.numero, a.rep, a.nom_voie, a.code_postal, a.code_commune, a.nom_commune,
+       a.parcelles, a.geom,
+       round(n.min_maternelle + w.marche, 1)   AS min_maternelle,  n.uai_maternelle,
+       round(n.min_elementaire + w.marche, 1)  AS min_elementaire, n.uai_elementaire,
+       round(n.min_college + w.marche, 1)      AS min_college,     n.uai_college,
+       round(n.min_lycee + w.marche, 1)        AS min_lycee,       n.uai_lycee,
+       round(p.minutes + w.marche, 1)          AS min_centre_bordeaux
+FROM dvf.ref_adresses a
+CROSS JOIN LATERAL (SELECT (coalesce(a.acces_m, 0) * 1.3 / 1.25 / 60)::numeric AS marche) w
+LEFT JOIN dvf.acces_noeuds n ON n.noeud = a.noeud
+LEFT JOIN dvf.acces_noeuds_poles p ON p.noeud = a.noeud AND p.pole = 'Centre de Bordeaux';
+
+-- -----------------------------------------------------------------------------
 -- Load audit trail: one row per successful (committed) load of a year.
 -- Written in the SAME transaction as the data, so it never lies.
 -- -----------------------------------------------------------------------------

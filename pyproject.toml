@@ -31,6 +31,8 @@ dependencies = [
     "requests",
     # Reads the legacy .xls of the long series (also installed in docker/airflow).
     "xlrd==2.0.2",
+    # Reads the OpenStreetMap extract for the walking graph (also in docker/airflow).
+    "osmium==4.3.1",
 ]
 
 [project.optional-dependencies]

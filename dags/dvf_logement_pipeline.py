@@ -40,7 +40,7 @@ import csv
 import io
 import logging
 import re
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -49,18 +49,25 @@ import requests
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.sdk import dag, task
 from airflow.sdk.exceptions import AirflowFailException
-from dvf_io import (
+from dvf_io import (  # noqa: F401  (re-exported for tests)
     SCHEMA_ADVISORY_LOCK_ID,
     LoadStats,
+    Spec,
     apply_sql_file,
     check_format,
+    check_gates,
     copy_buffer,
+    decode,
     download_file,
+    iter_typed,
     read_downloaded,
+    replace_rows,
     to_code_commune,
+    to_count,
     to_decimal,
     to_int,
     to_text,
+    to_year,
 )
 
 from dvf_common import HTTP_TIMEOUT, LOGEMENT_DAG_ID, DvfConfig
@@ -81,113 +88,6 @@ CDC_CSV = (
 # =============================================================================
 # Shared parsing
 # =============================================================================
-def decode(raw: bytes) -> str:
-    """UTF-8 (with or without BOM), else Windows-1252."""
-    try:
-        return raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        return raw.decode("cp1252")
-
-
-def to_count(value: str) -> int | None:
-    """' 26 755    ' -> 26755 (spaces, including non-breaking, are thousands separators)."""
-    return to_int(re.sub(r"[\s  ]", "", value or ""))
-
-
-def to_year(value: str) -> int | None:
-    year = to_int(value)
-    if year is not None and not 1000 <= year <= 2100:
-        raise ValueError(f"implausible year {value!r}")
-    return year
-
-
-Spec = dict[str, tuple[tuple[str, ...], Callable[[str], Any]]]
-
-
-def iter_typed(
-    records: Iterable[dict[str, str]],
-    fieldnames: list[str],
-    spec: Spec,
-    required: set[str],
-    stats: LoadStats,
-    label: str,
-) -> Iterator[list[Any]]:
-    """Typed rows from dict records; each target column accepts several source names."""
-    names = {name.strip(): name for name in fieldnames}
-    plan: list[tuple[str, str | None, Callable[[str], Any]]] = []
-    for target, (aliases, convert) in spec.items():
-        source = next((names[a] for a in aliases if a in names), None)
-        if source is None and target in required:
-            raise AirflowFailException(
-                f"{label}: schema drift, none of {aliases} found"
-            )
-        plan.append((target, source, convert))
-    for record in records:
-        stats.rows_read += 1
-        row: list[Any] = []
-        try:
-            for target, source, convert in plan:
-                raw = (record.get(source) or "").strip() if source else ""
-                try:
-                    value = convert(raw)
-                except ValueError:
-                    if target in required:
-                        raise
-                    stats.nulled[target] += 1
-                    value = None
-                if value is None and target in required:
-                    raise ValueError(f"{target} is required")
-                row.append(value)
-        except ValueError as exc:
-            stats.rows_rejected += 1
-            if stats.rows_rejected <= 10:
-                log.warning("%s: rejected row: %s", label, exc)
-            continue
-        stats.rows_loaded += 1
-        yield row
-
-
-def check_gates(stats: LoadStats, min_rows: int, max_ratio: float, label: str) -> None:
-    if stats.rows_loaded < min_rows:
-        raise AirflowFailException(
-            f"{label}: only {stats.rows_loaded:,} rows (expected >= {min_rows:,})"
-        )
-    if stats.reject_ratio > max_ratio:
-        raise AirflowFailException(
-            f"{label}: reject ratio {stats.reject_ratio:.4%} "
-            f"({stats.rows_rejected:,} / {stats.rows_read:,})"
-        )
-    check_format(stats, max_ratio)
-
-
-def replace_rows(
-    cfg: DvfConfig,
-    table: str,
-    columns: list[str],
-    rows: Iterable[list[Any]],
-    where: str = "",
-    params: tuple = (),
-) -> None:
-    """DELETE (all, or `where`) + COPY, in one transaction under the schema lock."""
-    buffer = io.StringIO()
-    csv.writer(buffer, lineterminator="\n").writerows(rows)
-    hook = PostgresHook(postgres_conn_id=cfg.conn_id)
-    conn = hook.get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,))
-            cur.execute(f"DELETE FROM {table} {where}", params)
-            copy_buffer(
-                cur,
-                f"COPY {table} ({', '.join(columns)}) FROM STDIN WITH (FORMAT csv)",
-                buffer,
-            )
-        conn.commit()
-    except BaseException:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 # =============================================================================
