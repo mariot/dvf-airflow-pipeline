@@ -17,6 +17,7 @@ dags/
   dvf_loyers_pipeline.py     monthly DAG: rent indicators "Carte des loyers" for the DVF years
   dvf_logement_pipeline.py   monthly DAG: social housing (RPLS), vacancy (LOVAC), long series, CDC costs
   dvf_accessibilite_pipeline.py  monthly DAG: walking graph (OSM + pgRouting), schools, transport, addresses
+  dvf_zonages_pipeline.py    monthly DAG: quartiers (Bordeaux Métropole) and IRIS, then each sale's quartier / IRIS
   dvf_osm.py / dvf_transit.py    OSM -> walking graph; GTFS -> transit times (no DAG; .airflowignore)
   dvf_common.py              shared config (no DAG; listed in .airflowignore)
   dvf_io.py                  shared converters, COPY and download helpers (no DAG; .airflowignore)
@@ -326,6 +327,31 @@ maternelle, élémentaire, collège and lycée, and the typical door-to-centre
 minutes. In Gironde, 60% of addresses have an elementary school within 15 min
 on foot, and 8.6% are within 30 min of the centre of Bordeaux.
 
+### Quartiers and IRIS (`dvf_zonages_pipeline`)
+
+```
+sync_schema ──┬─> load_quartiers ──┐
+              └─> load_iris ───────┴─> refresh_semantic_layer
+```
+
+- **Quartiers**: Bordeaux Métropole's "Quartier des communes" (Licence
+  Ouverte, GeoJSON): 75 quartiers in 8 communes, mostly political quartiers
+  (Bordeaux: Bordeaux centre, Chartrons / Grand Parc / Jardin public, La
+  Bastide, Caudéran...). The other communes have none, and the publisher says
+  the dataset is still under construction (`valide`).
+- **IRIS**: IGN Contours...IRIS from the Géoplateforme WFS, paged, every
+  commune of the scope (837 in Gironde). Statistical units with numbered names.
+- Both are repaired (`ST_MakeValid`) and stored in Lambert-93.
+- `dvf.ventes` and `dvf.biens` get **`quartier`** and **`code_iris`** (point in
+  polygon; the quartier must be in the sale's commune), so the semantic layer
+  is rebuilt at the end. In Bordeaux 99.4% of sales get a quartier.
+- `dvf.zones` can hold part of a commune: `quartier` set = only that quartier.
+  **Rive droite** = the GPV Rive Droite area: Bassens, Cenon, Floirac, Lormont
+  and Bordeaux's La Bastide.
+
+New DAGs start unpaused in this stack and run their latest interval at once:
+don't add one while something depends on the semantic layer staying put.
+
 ### Semantic views on the new data (`sql/semantic_cadre_de_vie.sql`)
 
 Applied after `sql/semantic.sql` by `refresh_semantic_layer`; all scoped to
@@ -333,9 +359,11 @@ Gironde and linked by `code_commune` to `dvf.communes` (which now also holds
 each commune's outline): `dvf.loyers`, `dvf.logements_sociaux`,
 `dvf.logements_vacants`, `dvf.series_longues`, `dvf.cout_logement_social`,
 `dvf.ecoles`, `dvf.ecoles_ips`, `dvf.colleges_ivac`, `dvf.arrets_transport`,
-`dvf.dpe`, `dvf.acces_adresses` and `dvf.temps_trajet` (commute minutes per
-address and destination). Plain views: they never touch `dvf.ventes` /
-`dvf.biens`, so they can't change a result of the eval set.
+`dvf.dpe`, `dvf.acces_adresses`, `dvf.temps_trajet` (commute minutes per
+address and destination), `dvf.quartiers` and `dvf.iris`. Plain views: they
+never touch `dvf.ventes` / `dvf.biens`, so they can't change a result of the
+eval set. They must not depend on `dvf.communes` either (`semantic.sql` drops
+and rebuilds it): names come from `dvf.ref_communes_contours`.
 
 ## 5. Configuration
 
@@ -358,6 +386,8 @@ and read at **run time**, not at parse time.
 | `DVF_OSM_PBF_URL` | Geofabrik `aquitaine-latest.osm.pbf` | OpenStreetMap extract containing the scope |
 | `DVF_GTFS_FEEDS` | TBM, TransGironde, SNCF | JSON `{"network": "gtfs zip url"}` |
 | `DVF_SERIES_LONGUES_URL` | `.../valeur-immobilier-1800-2020_cle2abd1f.xls` | IGEDD long series workbook |
+| `DVF_QUARTIERS_URL` | Bordeaux Métropole `se_quart_s` GeoJSON export | Quartiers of the communes |
+| `DVF_IRIS_WFS_URL` | Géoplateforme WFS `STATISTICALUNITS.IRIS:contours_iris` | `{dep}` and `{start}` are filled in (department filter, paging) |
 
 Variables defined as env vars take precedence over the UI. To manage one in
 the UI, delete it from the compose file.

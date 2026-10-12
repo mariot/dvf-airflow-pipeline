@@ -18,6 +18,7 @@ DETECTOR_DAG_ID = "dvf_change_detector"
 LOYERS_DAG_ID = "dvf_loyers_pipeline"
 LOGEMENT_DAG_ID = "dvf_logement_pipeline"
 ACCES_DAG_ID = "dvf_accessibilite_pipeline"
+ZONAGES_DAG_ID = "dvf_zonages_pipeline"
 
 # 2014 is the first DVF year ever published. /latest only serves the last 5 years.
 MIN_YEAR = 2014
@@ -42,6 +43,19 @@ GTFS_FEEDS = {
     "publication/gironde-aggregated-gtfs.zip",
     "sncf": "https://eu.ftp.opendatasoft.com/sncf/plandata/Export_OpenData_SNCF_GTFS_NewTripId.zip",
 }
+# Quartiers of the communes of Bordeaux Métropole (Licence Ouverte), GeoJSON.
+QUARTIERS_URL = (
+    "https://datahub.bordeaux-metropole.fr/api/explore/v2.1/catalog/datasets/"
+    "se_quart_s/exports/geojson"
+)
+# Contours...IRIS (IGN / INSEE, Licence Ouverte), Géoplateforme WFS; {dep} is
+# replaced by a department code, {start} by the paging offset.
+IRIS_WFS_URL = (
+    "https://data.geopf.fr/wfs/ows?SERVICE=WFS&VERSION=2.0.0&REQUEST=GetFeature"
+    "&TYPENAMES=STATISTICALUNITS.IRIS:contours_iris&OUTPUTFORMAT=application/json"
+    "&SRSNAME=EPSG:4326&CQL_FILTER=code_insee%20LIKE%20%27{dep}%25%27"
+    "&SORTBY=code_iris&COUNT=1000&STARTINDEX={start}"
+)
 SERIES_LONGUES_URL = (
     "https://www.igedd.developpement-durable.gouv.fr/IMG/xls/"
     "valeur-immobilier-1800-2020_cle2abd1f.xls"
@@ -72,6 +86,8 @@ class DvfConfig:
     scope_departements: tuple[str, ...]
     osm_pbf_url: str
     gtfs_feeds: tuple[tuple[str, str], ...]
+    quartiers_url: str
+    iris_wfs_url: str
 
     @classmethod
     def from_airflow(cls) -> DvfConfig:
@@ -111,6 +127,8 @@ class DvfConfig:
                     Variable.get("DVF_GTFS_FEEDS", default=json.dumps(GTFS_FEEDS))
                 ).items()
             ),
+            quartiers_url=Variable.get("DVF_QUARTIERS_URL", default=QUARTIERS_URL),
+            iris_wfs_url=Variable.get("DVF_IRIS_WFS_URL", default=IRIS_WFS_URL),
         )
 
     def source_url(self, year: int) -> str:

@@ -57,7 +57,14 @@ CREATE TABLE IF NOT EXISTS dvf.zones (
     code_commune  VARCHAR(5)  NOT NULL,
     PRIMARY KEY (zone, code_commune)
 );
-COMMENT ON TABLE dvf.zones IS 'Groups of communes that are not in DVF (intercommunalités, bassins).';
+-- A zone can hold only part of a commune: one of its quartiers (dvf.quartiers).
+ALTER TABLE dvf.zones ADD COLUMN IF NOT EXISTS quartier TEXT;
+COMMENT ON TABLE dvf.zones IS
+    'Groups of communes that are not in DVF (intercommunalités, bassins, Rive droite). '
+    'When quartier is set, only that quartier of the commune belongs to the zone: join with '
+    'z.code_commune = v.code_commune AND (z.quartier IS NULL OR z.quartier = v.quartier).';
+COMMENT ON COLUMN dvf.zones.quartier IS
+    'NULL = the whole commune; else only this quartier of it (as dvf.ventes.quartier)';
 
 INSERT INTO dvf.zones (zone, code_commune)
 SELECT 'Bordeaux Métropole', unnest(ARRAY[
@@ -68,6 +75,17 @@ UNION ALL
 SELECT 'Bassin d''Arcachon', unnest(ARRAY[
     '33009','33529','33199','33527','33051','33019','33229','33005','33011','33236'])
 ON CONFLICT DO NOTHING;
+
+-- "Rive droite" = the area of the Grand Projet de Ville Rive Droite: Bassens,
+-- Cenon, Floirac, Lormont and Bordeaux's quartier La Bastide (right bank of the
+-- Garonne). The term can also mean La Bastide alone or every right-bank commune.
+INSERT INTO dvf.zones (zone, code_commune, quartier) VALUES
+    ('Rive droite', '33032', NULL),          -- Bassens
+    ('Rive droite', '33119', NULL),          -- Cenon
+    ('Rive droite', '33167', NULL),          -- Floirac
+    ('Rive droite', '33249', NULL),          -- Lormont
+    ('Rive droite', '33063', 'La Bastide')   -- Bordeaux, right bank only
+ON CONFLICT (zone, code_commune) DO UPDATE SET quartier = EXCLUDED.quartier;
 
 -- -----------------------------------------------------------------------------
 -- Derived objects: dropped and rebuilt (definition changes apply on next load)
@@ -85,6 +103,25 @@ $$;
 DROP MATERIALIZED VIEW IF EXISTS dvf.ventes;
 DROP MATERIALIZED VIEW IF EXISTS dvf.biens;
 DROP MATERIALIZED VIEW IF EXISTS dvf.communes;
+
+-- Zonings of a point (dvf_zonages_pipeline): the quartier of the same commune
+-- that contains it (validated objects first, then the smallest), and its IRIS
+-- (preferably of the same commune). NULL outside the covered communes or
+-- before the zonings are loaded.
+CREATE OR REPLACE FUNCTION dvf.quartier_du_point(p geometry, commune varchar)
+RETURNS text LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT q.nom FROM dvf.ref_quartiers AS q
+    WHERE q.code_commune = commune AND ST_Intersects(q.geom, p)
+    ORDER BY q.valide DESC NULLS LAST, ST_Area(q.geom), q.gid
+    LIMIT 1
+$$;
+CREATE OR REPLACE FUNCTION dvf.iris_du_point(p geometry, commune varchar)
+RETURNS varchar LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT i.code_iris FROM dvf.ref_iris AS i
+    WHERE ST_Intersects(i.geom, p)
+    ORDER BY (i.code_commune = commune) DESC, i.code_iris
+    LIMIT 1
+$$;
 
 -- dvf.communes: ONE row and ONE canonical name per commune code of the scope.
 -- Names come from the official list (dvf.ref_communes); a code missing from it
@@ -169,7 +206,8 @@ signatures AS (
            max(n) AS n, min(ligne) AS ligne
     FROM par_culture
     GROUP BY 1, 2, 3, 4, 5, 6, 7, 8
-)
+),
+base AS (
 SELECT
     l.annee,
     l.id_mutation,
@@ -196,10 +234,19 @@ SELECT
 FROM signatures AS s
 JOIN lignes AS l ON l.annee = s.annee AND l.num_ligne_source = s.ligne
 LEFT JOIN dvf.communes AS c ON c.code_commune = l.code_commune
-CROSS JOIN LATERAL generate_series(1, s.n);
+CROSS JOIN LATERAL generate_series(1, s.n)
+)
+SELECT base.*,
+       dvf.quartier_du_point(base.geom, base.code_commune) AS quartier,
+       dvf.iris_du_point(base.geom, base.code_commune)     AS code_iris
+FROM base;
 
 COMMENT ON MATERIALIZED VIEW dvf.biens IS
     'One row per property sold (deduplicated). Count properties here; prices live in dvf.ventes.';
+COMMENT ON COLUMN dvf.biens.quartier IS
+    'Quartier containing the property (see dvf.quartiers): only communes of Bordeaux Métropole that defined quartiers, else NULL';
+COMMENT ON COLUMN dvf.biens.code_iris IS
+    'INSEE IRIS containing the property (see dvf.iris)';
 
 CREATE INDEX biens_commune_annee_idx ON dvf.biens (code_commune, annee);
 CREATE INDEX biens_id_mutation_idx   ON dvf.biens (id_mutation);
@@ -246,7 +293,8 @@ locaux AS (
            (array_agg(b ORDER BY (code_type_local IN (1, 2)) DESC, code_type_local))[1] AS principal
     FROM dvf.biens AS b
     GROUP BY id_mutation
-)
+),
+base AS (
 SELECT
     m.annee,
     m.id_mutation,
@@ -309,7 +357,12 @@ CROSS JOIN LATERAL (
            f0.bien_unique
            AND m.nature_mutation IN ('Vente', 'Vente en l''état futur d''achèvement')
            AND m.valeur_fonciere > 0                                                         AS vente_reference
-) AS flags;
+) AS flags
+)
+SELECT base.*,
+       dvf.quartier_du_point(base.geom, base.code_commune) AS quartier,
+       dvf.iris_du_point(base.geom, base.code_commune)     AS code_iris
+FROM base;
 
 COMMENT ON MATERIALIZED VIEW dvf.ventes IS
     'One row per mutation (Gironde). valeur_fonciere stated ONCE: safe to SUM/AVG. '
@@ -323,11 +376,16 @@ COMMENT ON COLUMN dvf.ventes.est_vente IS
     'Vente, VEFA, Vente terrain à bâtir or Adjudication (excludes Echange, Expropriation)';
 COMMENT ON COLUMN dvf.ventes.vente_reference IS
     'Used for price statistics: bien_unique, nature Vente or VEFA, valeur_fonciere > 0';
+COMMENT ON COLUMN dvf.ventes.quartier IS
+    'Quartier containing the sale (see dvf.quartiers): only communes of Bordeaux Métropole that defined quartiers, else NULL';
+COMMENT ON COLUMN dvf.ventes.code_iris IS
+    'INSEE IRIS containing the sale (see dvf.iris)';
 
 CREATE UNIQUE INDEX ventes_id_mutation_idx ON dvf.ventes (id_mutation);
 CREATE INDEX ventes_commune_annee_idx      ON dvf.ventes (code_commune, annee);
 CREATE INDEX ventes_annee_idx              ON dvf.ventes (annee);
 CREATE INDEX ventes_geom_idx               ON dvf.ventes USING gist (geom);
+CREATE INDEX ventes_quartier_idx           ON dvf.ventes (quartier);
 
 ANALYZE dvf.communes;
 ANALYZE dvf.biens;

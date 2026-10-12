@@ -297,6 +297,12 @@ def test_dags_folder_parses_like_the_dag_processor():
             "detect_changes": [],
             "trigger_reload": ["detect_changes"],
         },
+        "dvf_zonages_pipeline": {
+            "sync_schema": [],
+            "load_quartiers": ["sync_schema"],
+            "load_iris": ["sync_schema"],
+            "refresh_semantic_layer": ["load_iris", "load_quartiers"],
+        },
     }
 
 

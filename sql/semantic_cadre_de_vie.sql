@@ -191,3 +191,35 @@ COMMENT ON FUNCTION dvf.chercher_commune(text) IS
     'Fuzzy commune search: SELECT * FROM dvf.chercher_commune(''bordeau''). Ignores case, accents, '
     'hyphens, apostrophes, St/Ste and leading articles; tolerates typos. Returns only the best kind '
     'of match: exacte, else debut du nom (several rows = ambiguous: ask), else approchante.';
+
+-- -----------------------------------------------------------------------------
+-- Zonings inside communes (dvf_zonages_pipeline). dvf.ventes and dvf.biens
+-- carry each sale's quartier and code_iris (sql/semantic.sql): filter on those
+-- columns; these views give the list and the polygons.
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW dvf.quartiers AS
+SELECT q.code_commune, c.nom AS nom_commune, q.nom AS quartier, q.quartier_politique, q.valide, q.geom
+FROM dvf.ref_quartiers AS q
+-- Names from the outlines, NOT dvf.communes: semantic.sql drops and rebuilds
+-- that materialized view, which a view depending on it would block.
+JOIN dvf.ref_communes_contours AS c USING (code_commune)
+WHERE c.dep_code = '33';  -- SCOPE
+COMMENT ON VIEW dvf.quartiers IS
+    'Quartiers defined by some communes of Bordeaux Métropole (Bordeaux: 8 quartiers, e.g. '
+    'La Bastide, Caudéran; Pessac, Talence, Mérignac, Bègles...), mostly political quartiers. '
+    'Other communes have none. Source: Bordeaux Métropole, dataset under construction.';
+COMMENT ON COLUMN dvf.quartiers.quartier IS 'Name, as in dvf.ventes.quartier and dvf.biens.quartier';
+COMMENT ON COLUMN dvf.quartiers.valide IS 'false = not yet validated by the publisher: use with care';
+COMMENT ON COLUMN dvf.quartiers.geom IS 'MultiPolygon, Lambert-93';
+
+CREATE OR REPLACE VIEW dvf.iris AS
+SELECT i.code_iris, i.code_commune, c.nom AS nom_commune, i.nom_iris, i.type_iris, i.geom
+FROM dvf.ref_iris AS i
+JOIN dvf.ref_communes_contours AS c USING (code_commune)  -- not dvf.communes (see above)
+WHERE c.dep_code = '33';  -- SCOPE
+COMMENT ON VIEW dvf.iris IS
+    'INSEE IRIS: statistical areas of about 2 000 inhabitants (IGN Contours...IRIS). Names are '
+    'numbered (''Chartrons-Grand Parc 3''): statistical units, not names people use.';
+COMMENT ON COLUMN dvf.iris.type_iris IS
+    'H = housing, A = activity, D = miscellaneous (park, port...), Z = commune not divided (one IRIS)';
+COMMENT ON COLUMN dvf.iris.geom IS 'MultiPolygon, Lambert-93';

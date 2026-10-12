@@ -358,6 +358,31 @@ CREATE TABLE IF NOT EXISTS dvf.ref_communes_contours (
 );
 CREATE INDEX IF NOT EXISTS ref_communes_contours_geom_idx ON dvf.ref_communes_contours USING gist (geom);
 
+-- Zonings inside communes (dvf_zonages_pipeline). Quartiers: Bordeaux
+-- Métropole's division of its communes (mostly political quartiers, the
+-- dataset is "en cours de construction"). IRIS: INSEE's statistical areas
+-- (IGN Contours...IRIS), every commune of the scope.
+CREATE TABLE IF NOT EXISTS dvf.ref_quartiers (
+    gid                 INTEGER PRIMARY KEY,
+    code_commune        VARCHAR(5) NOT NULL,
+    nom                 TEXT NOT NULL,
+    quartier_politique  BOOLEAN,
+    valide              BOOLEAN,
+    modifie_le          TIMESTAMPTZ,
+    geom                geometry(MultiPolygon, 2154) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ref_quartiers_geom_idx ON dvf.ref_quartiers USING gist (geom);
+
+CREATE TABLE IF NOT EXISTS dvf.ref_iris (
+    code_iris     VARCHAR(9) PRIMARY KEY,
+    code_commune  VARCHAR(5) NOT NULL,
+    nom_commune   TEXT,
+    nom_iris      TEXT NOT NULL,
+    type_iris     CHAR(1),
+    geom          geometry(MultiPolygon, 2154) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ref_iris_geom_idx ON dvf.ref_iris USING gist (geom);
+
 -- Walking graph from OpenStreetMap: vertices are OSM node ids.
 CREATE TABLE IF NOT EXISTS dvf.osm_pieton (
     id          BIGINT PRIMARY KEY,

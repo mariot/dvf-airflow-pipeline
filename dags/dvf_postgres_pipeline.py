@@ -85,6 +85,7 @@ from dvf_io import (  # noqa: F401  re-exported: tests and helpers use dvf.<name
     copy_buffer,
     download_file,
     parse_http_date,
+    rebuild_semantic_layer,
     to_code_commune,
     to_code_departement,
     to_decimal,
@@ -570,27 +571,8 @@ def dvf_postgres_pipeline() -> None:
         summary: dict[str, Any], communes: dict[str, Any]
     ) -> None:
         """Task 4: rebuild the semantic layer (sql/semantic.sql + semantic_cadre_de_vie.sql)."""
-        cfg = DvfConfig.from_airflow()
-        # semantic.sql (DVF objects), then the housing / living-environment views
-        ddl = "\n".join(
-            (cfg.sql_dir / name).read_text(encoding="utf-8")
-            for name in ("semantic.sql", "semantic_cadre_de_vie.sql")
-        )
-        hook = PostgresHook(postgres_conn_id=cfg.conn_id)
-        conn = hook.get_conn()
-        try:
-            with conn.cursor() as cur:
-                # Same lock as sync_schema: parallel year loads rebuild one at a time.
-                cur.execute(
-                    "SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,)
-                )
-                cur.execute(ddl)
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        # Same lock as sync_schema: parallel year loads rebuild one at a time.
+        rebuild_semantic_layer(DvfConfig.from_airflow())
         log.info("Semantic layer rebuilt after loading %s", summary["year"])
 
     @task(execution_timeout=timedelta(minutes=15))

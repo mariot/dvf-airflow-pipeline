@@ -260,6 +260,30 @@ def apply_sql_file(cfg: DvfConfig, filename: str) -> None:
         conn.close()
 
 
+SEMANTIC_FILES = ("semantic.sql", "semantic_cadre_de_vie.sql")
+
+
+def rebuild_semantic_layer(cfg: DvfConfig) -> None:
+    """sql/semantic.sql (DVF objects) then the housing / living-environment
+    views, in ONE transaction under the schema lock: readers never see a
+    half-built layer."""
+    ddl = "\n".join(
+        (cfg.sql_dir / name).read_text(encoding="utf-8") for name in SEMANTIC_FILES
+    )
+    hook = PostgresHook(postgres_conn_id=cfg.conn_id)
+    conn = hook.get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (SCHEMA_ADVISORY_LOCK_ID,))
+            cur.execute(ddl)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def read_downloaded(path: str | Path) -> bytes:
     """Bytes of a file saved by download_file, gunzipped if needed.
 
